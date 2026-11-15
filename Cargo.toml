@@ -6,6 +6,10 @@ description = "Linux LED and fan controller tools for the EVGA Z790 CLASSIFIED"
 license = "MIT"
 repository = "https://github.com/sneakypeanut/evga-z790-tools"
 
+[[bin]]
+name = "evga"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"

@@ -1,55 +1,55 @@
 # evga-z790-tools
 
-Rust tools for Linux control of the **EVGA Z790 CLASSIFIED**'s two independent embedded
-controllers — its ARGB lighting and its fan controller. No Windows, no EVGA
-ELEET X1, no vendor driver.
+A single Rust CLI for Linux control of the **EVGA Z790 CLASSIFIED**'s ARGB
+lighting and fan controller. No Windows, no EVGA ELEET X1, no vendor driver.
 
 ```console
-$ evga-led off                     # lights out (USB HID, no root)
-$ evga-fan show                    # fan RPM, duty and curves (raw I/O ports, root)
-$ evga-fan quiet                   # gentler curves, 100% still at 70 C
+$ evga led off                     # lights out (USB HID, no root)
+$ evga fan show                    # fan RPM, duty and curves (raw I/O ports, root)
+$ evga fan quiet                   # gentler curves, 100% still at 70 C
 ```
 
-Both tools were reverse engineered from **ELEET X1 1.0.16.0**. The two controllers
-are unrelated hardware:
+Both controller protocols were reverse engineered from **ELEET X1 1.0.16.0**.
+The single CLI uses two independent hardware transports:
 
-| | `evga-led` | `evga-fan` |
+| | `evga led` | `evga fan` |
 |---|---|---|
 | Device | `3842:300e` "EVGA 5516 MCU AP" | Super I/O EC, I/O ports `0x4E`/`0x4F` |
 | Transport | HID feature reports (`/dev/hidrawN`) | raw port I/O (`/dev/port`) |
 | Privileges | udev `uaccess` rule → normal user | **root** (no safe unprivileged path) |
 | Controls | ARGB zones, effects, global dark mode | 8 fans: RPM, live PWM, 8-point curves |
 
-Supported: **EVGA Z790 CLASSIFIED (121-RL-E798), BIOS 1.20** — both tools tested
-on hardware. Other EVGA boards are unverified; ELEET ships per-board variants
+Supported: **EVGA Z790 CLASSIFIED (121-RL-E798), BIOS 1.20**. The original
+Python tools were tested on hardware. Rust LED detection and read-back have been
+verified; Rust fan writes have not yet been tested on hardware. Other EVGA boards
+are unverified; ELEET ships per-board variants
 (`Z490/Z590/Z690/Z790/W999/X570`).
 
 ---
 
-# evga-led — ARGB lighting
+# evga led — ARGB lighting
 
 The board's onboard ARGB is the illuminated "Z790 | CLASSIFIED" text on the rear
 I/O shroud (`ARGB_COVER`), plus four addressable headers (`ARGB1`–`ARGB4`).
 
 ```
-evga-led [--device /dev/hidrawN] <action> [-z ZONE] [-n]
+evga led [--device /dev/hidrawN] [action] [-z ZONE] [-n]
 
 actions:  off | on | mode <name> | status | detect
 zones:    all (default) | onboard | argb1 | argb2 | argb3 | argb4
 modes:    off on breathing rainbow pulse rainbowwave wave star colorstack
 ```
 
+With no action, `evga led` shows status.
+
 `-n/--dry-run` prints the exact 226-byte frame without touching the device.
 
 ## Install
 
 ```bash
-# Build all four native binaries (Rust stable on Linux):
+# Build the native binary (Rust stable on Linux):
 cargo build --release --locked
-install -Dm755 target/release/evga-led ~/.local/bin/evga-led
-install -Dm755 target/release/evga-fan ~/.local/bin/evga-fan
-install -Dm755 target/release/evga-fan-probe ~/.local/bin/evga-fan-probe
-install -Dm755 target/release/evga-fan-sweep ~/.local/bin/evga-fan-sweep
+install -Dm755 target/release/evga ~/.local/bin/evga
 
 # let your user (not root) open the hidraw node:
 pkexec install -m644 "$PWD/60-evga-led.rules" /etc/udev/rules.d/
@@ -57,20 +57,16 @@ pkexec udevadm control --reload
 pkexec udevadm trigger --subsystem-match=hidraw
 ```
 
+This replaces the earlier `evga-led`, `evga-fan`, `evga-fan-probe` and
+`evga-fan-sweep` executables. Previously installed copies can be removed after
+installing `evga`.
+
 The rule **must** be numbered below `73-seat-late.rules` (hence `60-`): udev only
 acts on the `uaccess` tag before that point, so a `99-` rule installs cleanly and
 silently grants nothing.
 
-Without the rule, `evga-led` falls back to running itself in a container with
-`--device` access (docker group = root-equivalent). It mounts and executes the
-native binary; no Python interpreter is used. The default image is
-`archlinux:base`. Override it with `EVGA_LED_IMAGE` if needed; the image must
-provide a compatible dynamic loader and glibc for your build. The old
-`EVGA_LED_PYTHON` setting is no longer used.
-
-```bash
-evga-led off
-```
+Install the udev rule for direct LED access as your normal user. If permissions
+are missing, the CLI reports the rule to install. No container runtime is needed.
 
 ## Protocol
 
@@ -122,21 +118,23 @@ data `0` = dark, `1` = lit. Not yet exposed as a CLI flag.
 
 ---
 
-# evga-fan — fan curves
+# evga fan — fan curves
 
 ```
-evga-fan backup            dump both EC pages to ~/.local/state/evga-fan/
-evga-fan show              RPM, live duty, curves per fan
-evga-fan quiet             write gentle curves (never below the stall floor)
-evga-fan curve FAN t0..t7 p0..p7
-evga-fan restore [FILE]    write both pages back verbatim
+evga fan backup            dump both EC pages to ~/.local/state/evga-fan/
+evga fan show              RPM, live duty, curves per fan
+evga fan quiet             write gentle curves (never below the stall floor)
+evga fan curve FAN t0..t7 p0..p7
+evga fan restore [FILE]    write both pages back verbatim
+evga fan probe             detailed EC identity and fan state
+evga fan sweep [FAN]       find a fan's stall floor (default: fan 7)
 ```
 
 Fans 0–7 correspond to the board's fan headers; headers with nothing plugged in
 read `0 RPM` and are skipped by `quiet`.
 
-The Rust tools replace the Python scripts. LED command names and frame bytes
-remain compatible; fan backups retain the `acpi` and `smartfan` JSON arrays so
+The single `evga` executable replaces the Python scripts. LED actions and frame
+bytes remain compatible under `evga led`; fan backups retain the `acpi` and `smartfan` JSON arrays so
 existing backups can be restored. The Rust fan commands validate input before
 accessing the EC and save a backup before changing its configuration.
 
@@ -146,7 +144,7 @@ need a higher floor. Custom curves must use nondecreasing temperatures and dutie
 with full duty by 70 °C and a minimum of 35%. Restore is a verbatim recovery
 operation and can reapply curves below these limits.
 
-`evga-fan-probe` prints EC identity and detailed fan state. `evga-fan-sweep [FAN]`
+`evga fan probe` prints EC identity and detailed fan state. `evga fan sweep [FAN]`
 measures a fan's low-duty behavior and settles a curve above the measured floor;
 it deliberately tries duties as low as 20% and should be run only while watching
 temperatures. An I/O failure triggers an attempt to restore the original curve;
@@ -160,12 +158,12 @@ Check the probe's readings before using sweep to tune a fan.
 
 ## Root is required
 
-`evga-fan` writes I/O ports `0x4E`/`0x4F` through `/dev/port`, which needs
+`evga fan` writes I/O ports `0x4E`/`0x4F` through `/dev/port`, which needs
 `CAP_SYS_RAWIO`. There is deliberately no udev rule for this: a `kmem` ACL for a
 normal user is a much larger hole than a hidraw node. Run the native binary with `pkexec`:
 
 ```bash
-pkexec "$HOME/.local/bin/evga-fan" show
+pkexec "$HOME/.local/bin/evga" fan show
 ```
 
 The state directory follows the process's `HOME` or `EVGA_FAN_STATE`. `pkexec`
@@ -174,12 +172,14 @@ normally `/root/.local/state/evga-fan/`. To choose an explicit backup directory:
 
 ```bash
 pkexec env EVGA_FAN_STATE="$HOME/.local/state/evga-fan" \
-  "$HOME/.local/bin/evga-fan" backup
+  "$HOME/.local/bin/evga" fan backup
 ```
 
 Use the same directory for later commands, or give `restore` an absolute backup
-path. Restore rejects backups without full EC pages and an EVGA vendor ID;
-it still restores the page bytes verbatim, including any manual fan settings.
+path. Files created through `pkexec` are owned by root, including those written
+to a directory under your home. Restore rejects backups without full EC pages
+and an EVGA vendor ID; it still restores the page bytes verbatim, including any
+manual fan settings.
 
 ## Protocol
 
@@ -219,11 +219,11 @@ Page `0xC7` (`SmartFanProtocol`):
 
 ## Safety rules (learned the hard way)
 
-- **Back up before writing.** `evga-fan backup` dumps both pages; `restore` puts
+- **Back up before writing.** `evga fan backup` dumps both pages; `restore` puts
   them back. Do this before any curve edit.
 - **Never set a duty below a fan's stall floor.** Measured on this board: one fan
   stops entirely at 20–30% and only spins from 35% up. A stalled fan reads `0 RPM`
-  and silently provides no cooling. Sweep with `evga-fan-sweep` to find the floor per
+  and silently provides no cooling. Sweep with `evga fan sweep` to find the floor per
   fan, then sit ≥10 points above it.
 - **Always keep 100% by ~70 °C.** Soften only the low end of the curve; leave the
   top end intact so load behaviour is unchanged.
@@ -239,7 +239,7 @@ Page `0xC7` (`SmartFanProtocol`):
 ```
 src/led.rs              ARGB protocol, HID transport, CLI
 src/fan.rs              EC transport, fan control, probe and sweep
-src/bin/                evga-led, evga-fan, evga-fan-probe, evga-fan-sweep
+src/main.rs             single evga CLI and main function
 tests/                  CLI checks and Python-derived LED parity fixtures
 60-evga-led.rules       udev rule: hidraw uaccess for 3842:300e
 ```

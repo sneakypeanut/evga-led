@@ -17,7 +17,8 @@ fn led_dry_runs_match_original_python() {
         serde_json::from_str(include_str!("fixtures/led-frames.json")).unwrap();
     assert_eq!(fixtures.len(), 77);
     for fixture in fixtures {
-        let output = Command::new(env!("CARGO_BIN_EXE_evga-led"))
+        let output = Command::new(env!("CARGO_BIN_EXE_evga"))
+            .arg("led")
             .args(["mode", &fixture.mode, "-z", &fixture.zone, "--dry-run"])
             .output()
             .unwrap();
@@ -63,21 +64,46 @@ fn led_dry_runs_match_original_python() {
 }
 
 #[test]
-fn all_binaries_offer_help_without_hardware() {
-    for binary in [
-        env!("CARGO_BIN_EXE_evga-led"),
-        env!("CARGO_BIN_EXE_evga-fan"),
-        env!("CARGO_BIN_EXE_evga-fan-probe"),
-        env!("CARGO_BIN_EXE_evga-fan-sweep"),
+fn all_commands_offer_help_without_hardware() {
+    for args in [
+        vec!["--help"],
+        vec!["led", "--help"],
+        vec!["fan", "--help"],
+        vec!["fan", "probe", "--help"],
+        vec!["fan", "sweep", "--help"],
     ] {
-        let output = Command::new(binary).arg("--help").output().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_evga"))
+            .args(&args)
+            .output()
+            .unwrap();
         assert!(
             output.status.success(),
-            "{binary}: {}",
+            "{args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
     }
+}
+
+#[test]
+fn probe_uses_its_device_without_requiring_a_state_directory() {
+    let device = "/nonexistent-evga-test-port";
+    let output = Command::new(env!("CARGO_BIN_EXE_evga"))
+        .args(["fan", "probe", "--device", device])
+        .env_remove("HOME")
+        .env_remove("EVGA_FAN_STATE")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains(device),
+        "probe did not use requested device: {error}"
+    );
+    assert!(
+        !error.contains("HOME"),
+        "probe required a state directory: {error}"
+    );
 }
 
 #[test]
@@ -88,7 +114,8 @@ fn invalid_led_arguments_fail_without_hardware() {
         vec!["on", "unexpected", "--dry-run"],
         vec!["off", "--zone", "invalid", "--dry-run"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_evga-led"))
+        let output = Command::new(env!("CARGO_BIN_EXE_evga"))
+            .arg("led")
             .args(&args)
             .output()
             .unwrap();
@@ -105,7 +132,8 @@ fn fan_rejects_unsafe_inputs_before_opening_ports() {
         ("0", "80", "100", "100%"),
     ];
     for (fan, full_temp, full_pwm, message) in cases {
-        let output = Command::new(env!("CARGO_BIN_EXE_evga-fan"))
+        let output = Command::new(env!("CARGO_BIN_EXE_evga"))
+            .arg("fan")
             .args([
                 "curve", fan, "0", "40", "50", "60", full_temp, "127", "127", "127", "45", "55",
                 "65", "80", full_pwm, "100", "100", "100",
@@ -120,7 +148,8 @@ fn fan_rejects_unsafe_inputs_before_opening_ports() {
             "opened hardware before validation: {error}"
         );
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_evga-fan-sweep"))
+    let output = Command::new(env!("CARGO_BIN_EXE_evga"))
+        .args(["fan", "sweep"])
         .arg("8")
         .output()
         .unwrap();
@@ -132,7 +161,8 @@ fn fan_rejects_unsafe_inputs_before_opening_ports() {
 fn malformed_restore_is_rejected_before_opening_ports() {
     let path = std::env::temp_dir().join(format!("evga-cli-restore-{}.json", std::process::id()));
     std::fs::write(&path, r#"{"acpi":[1],"smartfan":[2]}"#).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_evga-fan"))
+    let output = Command::new(env!("CARGO_BIN_EXE_evga"))
+        .arg("fan")
         .arg("restore")
         .arg(&path)
         .output()
@@ -155,7 +185,8 @@ fn foreign_backup_is_rejected_before_opening_ports() {
     let path = std::env::temp_dir().join(format!("evga-cli-foreign-{}.json", std::process::id()));
     let body = serde_json::json!({"acpi": vec![0u8; 256], "smartfan": vec![0u8; 256]});
     std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_evga-fan"))
+    let output = Command::new(env!("CARGO_BIN_EXE_evga"))
+        .arg("fan")
         .arg("restore")
         .arg(&path)
         .output()

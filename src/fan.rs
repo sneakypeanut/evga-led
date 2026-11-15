@@ -27,11 +27,11 @@ use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
 /// Name used in help output and error messages.
-const TOOL: &str = "evga-fan";
+const TOOL: &str = "evga fan";
 
 /// Raw port device, requires `CAP_SYS_RAWIO`.
 pub const PORT_PATH: &str = "/dev/port";
@@ -144,7 +144,7 @@ impl PortBus {
             return Err(io::Error::new(
                 err.kind(),
                 format!(
-                    "{}: cannot lock the EC: {err} (another evga-fan process is \
+                    "{}: cannot lock the EC: {err} (another {TOOL} process is \
                      probably running; only one process may drive the EC)",
                     path.display()
                 ),
@@ -157,10 +157,12 @@ impl PortBus {
 fn open_error(path: &Path, err: io::Error) -> io::Error {
     let hint = match err.raw_os_error() {
         Some(libc::EACCES) | Some(libc::EPERM) => {
-            "port I/O needs root or CAP_SYS_RAWIO; run evga-fan through pkexec"
+            format!("port I/O needs root or CAP_SYS_RAWIO; run {TOOL} through pkexec")
         }
-        Some(libc::ENOENT) => "this kernel has no /dev/port; the raw port driver is missing",
-        _ => "cannot open the EC port",
+        Some(libc::ENOENT) => {
+            "this kernel has no /dev/port; the raw port driver is missing".to_string()
+        }
+        _ => "cannot open the EC port".to_string(),
     };
     io::Error::new(err.kind(), format!("{}: {}: {hint}", path.display(), err))
 }
@@ -279,7 +281,7 @@ fn require_evga_ec(state: &EcState) -> io::Result<()> {
     if vendor != EVGA_VENDOR_ID {
         return fail(format!(
             "refusing to write: VendorID at 0xC4:0 is 0x{vendor:04X}, not the EVGA Z790 EC \
-             (0x{EVGA_VENDOR_ID:04X}); run evga-fan-probe to inspect this machine"
+             (0x{EVGA_VENDOR_ID:04X}); run `{TOOL} probe` to inspect this machine"
         ));
     }
     Ok(())
@@ -444,7 +446,7 @@ fn validate_curve(curve: &Curve, min_low_pwm: u8) -> std::result::Result<(), Fan
     if curve.pwms[0] < min_low_pwm {
         return Err(FanError::new(format!(
             "lowest duty {}% is below the {}% floor; fans on this board stall below {}% \
-             (run evga-fan-sweep to find the real floor for this fan)",
+             (run `{TOOL} sweep` to find the real floor for this fan)",
             curve.pwms[0], min_low_pwm, STALL_FLOOR_PCT
         )));
     }
@@ -720,10 +722,8 @@ fn restore_pages<B: EcBus>(ec: &mut Ec<B>, state: &EcState) -> io::Result<()> {
 // CLI
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Args)]
 #[command(
-    name = "evga-fan",
-    version,
     about = "EVGA Z790 fan control via the Super I/O EC",
     long_about = "EVGA Z790 fan control via the Super I/O EC.\n\n\
                   Writes raw I/O ports and needs root or CAP_SYS_RAWIO. Backs up both EC \
@@ -757,6 +757,18 @@ pub enum Action {
     Restore {
         /// Backup JSON, defaults to the newest backup-*.json
         file: Option<PathBuf>,
+    },
+    /// Read-only dump of EC IDs, RPM, duty and curves
+    Probe {
+        /// Raw port device to read
+        #[arg(long, default_value = PORT_PATH, value_name = "PATH")]
+        device: PathBuf,
+    },
+    /// Find a fan's stall floor, then settle a safe curve
+    Sweep {
+        /// Fan index to sweep, 0..=7
+        #[arg(default_value_t = 7)]
+        fan: i64,
     },
 }
 
@@ -793,6 +805,12 @@ fn plan_action(args: &Cli, dir: &Path) -> std::result::Result<Plan, FanError> {
             require_evga_ec(&state).map_err(FanError::from)?;
             Plan::Restore { path, state }
         }
+        // Handled by `run` before planning; neither goes through a Plan.
+        Action::Probe { .. } | Action::Sweep { .. } => {
+            return Err(FanError::new(
+                "internal error: probe and sweep are dispatched before planning",
+            ));
+        }
     })
 }
 
@@ -802,11 +820,26 @@ impl From<io::Error> for FanError {
     }
 }
 
-/// CLI entry point for `evga-fan`.
-pub fn run() -> Result<(), Box<dyn Error>> {
-    let args = Cli::parse();
-    let dir = state_dir()?;
-    run_with(args, &dir, open_hardware)
+/// Entry point for `evga fan ...`: probe and sweep first (they own their own
+/// hardware access), everything else through the validated `run_with` path.
+/// `state_dir` is only resolved for commands that use backups, so probe still
+/// works with HOME unset.
+pub fn run(args: Cli) -> Result<(), Box<dyn Error>> {
+    match &args.action {
+        Action::Probe { device } => {
+            let mut ec = Ec::new(PortBus::open(device)?);
+            probe(&mut ec)?;
+            Ok(())
+        }
+        Action::Sweep { fan } => {
+            let dir = state_dir()?;
+            sweep_run_with(*fan, &dir, open_hardware)
+        }
+        _ => {
+            let dir = state_dir()?;
+            run_with(args, &dir, open_hardware)
+        }
+    }
 }
 
 fn run_with<B, F>(args: Cli, dir: &Path, open: F) -> Result<(), Box<dyn Error>>
@@ -908,26 +941,6 @@ fn quiet_with<B: EcBus>(ec: &mut Ec<B>, dir: &Path, timing: Timing) -> io::Resul
 // Read-only probe
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "evga-fan-probe",
-    version,
-    about = "Read-only probe of the EVGA Z790 fan data on the Super I/O EC"
-)]
-pub struct ProbeCli {
-    /// Raw port device to read
-    #[arg(long, default_value = PORT_PATH, value_name = "PATH")]
-    pub device: PathBuf,
-}
-
-/// CLI entry point for `evga-fan-probe`. Never writes to the EC.
-pub fn probe_main() -> Result<(), Box<dyn Error>> {
-    let args = ProbeCli::parse();
-    let mut ec = Ec::new(PortBus::open(&args.device)?);
-    probe(&mut ec)?;
-    Ok(())
-}
-
 fn probe<B: EcBus>(ec: &mut Ec<B>) -> io::Result<()> {
     let ident = read_block(ec, PAGE_ACPI, 0, 10)?;
     let vendor = u16::from(ident[0]) | (u16::from(ident[1]) << 8);
@@ -979,25 +992,6 @@ fn probe<B: EcBus>(ec: &mut Ec<B>) -> io::Result<()> {
 // ---------------------------------------------------------------------------
 // Sweep
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Parser)]
-#[command(
-    name = "evga-fan-sweep",
-    version,
-    about = "Find the PWM floor at which a fan keeps spinning, then set a safe curve"
-)]
-pub struct SweepCli {
-    /// Fan index to sweep, 0..=7
-    #[arg(default_value_t = 7)]
-    pub fan: i64,
-}
-
-/// CLI entry point for `evga-fan-sweep`.
-pub fn sweep_main() -> Result<(), Box<dyn Error>> {
-    let args = SweepCli::parse();
-    let dir = state_dir()?;
-    sweep_run_with(args.fan, &dir, open_hardware)
-}
 
 /// Validate the fan index, then open hardware and sweep.
 fn sweep_run_with<B, F>(fan: i64, dir: &Path, open: F) -> Result<(), Box<dyn Error>>
@@ -1111,7 +1105,7 @@ fn sweep_steps<B: EcBus>(
             // so the caller restores the original curve instead.
             return Err(io::Error::other(format!(
                 "fan {fan}: Current_PWM reports {measured}, outside 0..=100; the register unit \
-                 is unverified, so not sweeping. Run evga-fan-probe and check Current_PWM"
+                 is unverified, so not sweeping. Run `{TOOL} probe` and check Current_PWM"
             )));
         }
         if verbose {

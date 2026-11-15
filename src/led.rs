@@ -35,18 +35,15 @@
 //!
 //! Access: `/dev/hidrawN` is root-only. Install
 //! `SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3842", ATTRS{idProduct}=="300e", TAG+="uaccess"`
-//! in /etc/udev/rules.d/, or let the tool fall back to running itself inside a
-//! container (docker group is root-equivalent, so no password prompt).
+//! in /etc/udev/rules.d/ (60-evga-led.rules) so the logged-in user can open it.
 
 use std::error::Error;
-use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use clap::{CommandFactory, Parser, ValueEnum};
+use clap::{Args, ValueEnum};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -60,11 +57,6 @@ pub const SUB_READ: u8 = 1;
 const VENDOR_PRODUCT: &str = "00003842:0000300E";
 /// `85 07` in a HID report descriptor: Report ID 7.
 const REPORT7_TAG: [u8; 2] = [0x85, 0x07];
-/// The container runs this host-built binary, so the image needs a glibc at least
-/// as new as the build host's. Arch is rolling, so its glibc is never older.
-const DEFAULT_IMAGE: &str = "archlinux:base";
-/// Set inside the container so a second permission failure cannot recurse.
-const CONTAINER_GUARD: &str = "EVGA_LED_IN_CONTAINER";
 const UDEV_RULE: &str =
     r#"SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3842", ATTRS{idProduct}=="300e", TAG+="uaccess""#;
 
@@ -110,25 +102,21 @@ const MODE_NAMES: [&str; 9] = [
     "colorstack",
 ];
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "evga-led",
-    about = "EVGA Z790 onboard ARGB control",
-    // The container fallback appends `--device PATH` after the user's arguments;
-    // the last value wins, as with argparse.
-    args_override_self = true
-)]
-struct Cli {
+/// EVGA Z790 onboard ARGB control
+#[derive(Args, Debug)]
+pub struct Cli {
     /// hidraw node (default: autodetect)
-    #[arg(long)]
+    // A repeated --device takes the last value, as with argparse.
+    #[arg(long, overrides_with = "device")]
     device: Option<PathBuf>,
     #[arg(value_enum, default_value_t = Action::Status)]
     action: Action,
     /// mode name for 'mode'
     mode: Option<String>,
-    /// all | onboard | argb1..argb4 (default: all)
+    /// all | onboard | argb1..argb4
     #[arg(short, long, default_value = "all")]
     zone: String,
+    /// print the frame without touching the device
     #[arg(short = 'n', long)]
     dry_run: bool,
 }
@@ -142,28 +130,23 @@ enum Action {
     Detect,
 }
 
-/// Parse the process arguments and run the requested action.
-pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+/// Run the parsed `led` command.
+pub fn run(cli: Cli) -> Result<()> {
     if let Some(mode) = &cli.mode {
         if cli.action != Action::Mode {
             let action = cli.action.to_possible_value().expect("no skipped variants");
-            Cli::command()
-                .error(
-                    clap::error::ErrorKind::ArgumentConflict,
-                    format!("'{}' takes no mode name (got '{mode}')", action.get_name()),
-                )
-                .exit();
+            return Err(
+                format!("'{}' takes no mode name (got '{mode}')", action.get_name()).into(),
+            );
         }
     }
-    let argv: Vec<OsString> = std::env::args_os().skip(1).collect();
-    execute(&cli, &argv)
+    execute(&cli)
 }
 
-fn execute(cli: &Cli, argv: &[OsString]) -> Result<()> {
+fn execute(cli: &Cli) -> Result<()> {
     match cli.action {
         Action::Detect => do_detect(&find_device(cli.device.as_deref())?),
-        Action::Status => do_status(&find_device(cli.device.as_deref())?, argv),
+        Action::Status => do_status(&find_device(cli.device.as_deref())?),
         Action::Off | Action::On | Action::Mode => {
             let zone = parse_zone(&cli.zone)?;
             let mode = match cli.action {
@@ -177,7 +160,7 @@ fn execute(cli: &Cli, argv: &[OsString]) -> Result<()> {
             } else {
                 Some(find_device(cli.device.as_deref())?)
             };
-            do_set(path.as_deref(), zone, mode, argv)
+            do_set(path.as_deref(), zone, mode)
         }
     }
 }
@@ -297,13 +280,25 @@ fn descriptor_path(node: &Path) -> PathBuf {
         .join("device/report_descriptor")
 }
 
-/// Open the node read-write; `Ok(None)` means permission denied.
-fn open_node(path: &Path) -> Result<Option<File>> {
-    match OpenOptions::new().read(true).write(true).open(path) {
-        Ok(f) => Ok(Some(f)),
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Ok(None),
-        Err(e) => Err(format!("{}: {e}", path.display()).into()),
-    }
+/// Open the node read-write; permission denied explains the udev rule.
+fn open_node(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::PermissionDenied {
+                format!(
+                    "{}: permission denied on the hidraw node; install the udev rule \
+                     60-evga-led.rules ({UDEV_RULE}) in /etc/udev/rules.d/, then reload udev \
+                     and replug or trigger",
+                    path.display()
+                )
+            } else {
+                format!("{}: {e}", path.display())
+            }
+            .into()
+        })
 }
 
 fn feature_ioctl(file: &File, request: u32, buf: &mut [u8; BUFLEN]) -> io::Result<()> {
@@ -347,73 +342,22 @@ fn errno_name(err: &io::Error) -> String {
     name.into()
 }
 
-/// The docker invocation that reruns this binary with access to `device`.
-/// `device` must be absolute; the trailing `--device` overrides any in `argv`,
-/// so the container opens exactly the node it was given.
-fn container_command(exe: &Path, image: &str, device: &Path, argv: &[OsString]) -> Command {
-    let mut mount = OsString::from(exe);
-    mount.push(":/evga-led:ro");
-    let mut cmd = Command::new("docker");
-    cmd.args(["run", "--rm", "--device"])
-        .arg(device)
-        .arg("-v")
-        .arg(mount)
-        .args(["-e", &format!("{CONTAINER_GUARD}=1")])
-        .args(["--entrypoint", "/evga-led", image])
-        .args(argv)
-        .arg("--device")
-        .arg(device);
-    cmd
-}
-
-fn find_in_path(program: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
-    std::env::split_paths(path_var?)
-        .map(|dir| dir.join(program))
-        .find(|p| p.is_file())
-}
-
-/// Rerun ourselves inside a container so root can open the hidraw node.
-fn reopen_via_container(path: &Path, argv: &[OsString]) -> Result<()> {
-    let denied = "permission denied on the hidraw node";
-    if std::env::var_os(CONTAINER_GUARD).is_some() {
-        return Err(format!("{denied}, even inside the container.").into());
-    }
-    if find_in_path("docker", std::env::var_os("PATH").as_deref()).is_none() {
-        return Err(
-            format!("{denied}, and docker is unavailable.\ninstall the rule: {UDEV_RULE}").into(),
-        );
-    }
-    let image = std::env::var("EVGA_LED_IMAGE").unwrap_or_else(|_| DEFAULT_IMAGE.into());
-    let exe = fs::canonicalize(std::env::current_exe()?)?;
-    let device = fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    eprintln!("(using a container for device access: {image})");
-    let status = container_command(&exe, &image, &device, argv).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "container run failed: {status}\nif the image's glibc is older than this binary needs \
-             (\"GLIBC_x.yy not found\" above) or the image has none (\"exec /evga-led: no such file or \
-             directory\"), set EVGA_LED_IMAGE to a newer glibc image \
-             (default {DEFAULT_IMAGE}), or install the udev rule: {UDEV_RULE}"
-        )
-        .into())
-    }
-}
-
 /// GET report 7: the MCU echoes its last command frame.
-fn read_state(path: &Path) -> Result<Option<[u8; BUFLEN]>> {
-    let Some(file) = open_node(path)? else {
-        println!("read-back unavailable (permission denied on the hidraw node)");
-        return Ok(None);
+fn read_state(path: &Path) -> Option<[u8; BUFLEN]> {
+    let file = match open_node(path) {
+        Ok(file) => file,
+        Err(e) => {
+            println!("read-back unavailable ({e})");
+            return None;
+        }
     };
     let mut buf = [0u8; BUFLEN];
     buf[0] = REPORT_ID; // hidraw reads the requested report ID from here
     match feature_ioctl(&file, hidiocgfeature(BUFLEN), &mut buf) {
-        Ok(()) => Ok(Some(buf)),
+        Ok(()) => Some(buf),
         Err(e) => {
             println!("read-back failed: {}", errno_name(&e));
-            Ok(None)
+            None
         }
     }
 }
@@ -466,7 +410,7 @@ fn status_lines(state: &[u8; BUFLEN]) -> Vec<String> {
     lines
 }
 
-fn do_set(path: Option<&Path>, zone: u8, mode: u8, argv: &[OsString]) -> Result<()> {
+fn do_set(path: Option<&Path>, zone: u8, mode: u8) -> Result<()> {
     let mut frame = build_frame(zone, mode, SUB_WRITE);
     let Some(path) = path else {
         for line in dry_run_lines(zone, mode, &frame) {
@@ -475,9 +419,7 @@ fn do_set(path: Option<&Path>, zone: u8, mode: u8, argv: &[OsString]) -> Result<
         return Ok(());
     };
 
-    let Some(file) = open_node(path)? else {
-        return reopen_via_container(path, argv);
-    };
+    let file = open_node(path)?;
     let checksum = frame[7];
     feature_ioctl(&file, hidiocsfeature(BUFLEN), &mut frame)
         .map_err(|e| format!("SET failed: {}", errno_name(&e)))?;
@@ -487,17 +429,15 @@ fn do_set(path: Option<&Path>, zone: u8, mode: u8, argv: &[OsString]) -> Result<
         "sent: zone 0x{zone:02X} -> {} (checksum 0x{checksum:02X})",
         mode_name(mode)
     );
-    if let Some(state) = read_state(path)? {
+    if let Some(state) = read_state(path) {
         println!("{}", read_back_line(&state));
     }
     Ok(())
 }
 
-fn do_status(path: &Path, argv: &[OsString]) -> Result<()> {
-    if open_node(path)?.is_none() {
-        return reopen_via_container(path, argv);
-    }
-    let state = read_state(path)?.ok_or("status read failed")?;
+fn do_status(path: &Path) -> Result<()> {
+    drop(open_node(path)?);
+    let state = read_state(path).ok_or("status read failed")?;
     for line in status_lines(&state) {
         println!("{line}");
     }
@@ -521,8 +461,16 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// `Cli` is flattened into the `evga led` subcommand; parse it the same way.
+    #[derive(clap::Parser)]
+    struct Root {
+        #[command(flatten)]
+        cli: Cli,
+    }
+
     fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
-        Cli::try_parse_from(std::iter::once("evga-led").chain(args.iter().copied()))
+        use clap::Parser;
+        Root::try_parse_from(std::iter::once("led").chain(args.iter().copied())).map(|r| r.cli)
     }
 
     #[test]
@@ -609,7 +557,7 @@ mod tests {
 
     #[test]
     fn repeated_device_takes_last_value() {
-        // The container rerun appends `--device PATH` after the user's own.
+        // argparse semantics: the last --device wins rather than an error.
         let cli = parse(&[
             "--device",
             "/dev/hidraw9",
@@ -622,19 +570,51 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_needs_no_device_and_mode_requires_name() {
-        let cli = parse(&["--device", "/nonexistent/hidraw0", "-n", "off"]).unwrap();
-        assert!(execute(&cli, &[]).is_ok());
-        let cli = parse(&["-n", "mode"]).unwrap();
+    fn dry_run_needs_no_device_and_bad_requests_return_errors() {
+        let run_args = |args: &[&str]| run(parse(args).unwrap()).map_err(|e| e.to_string());
+        assert!(run_args(&["--device", "/nonexistent/hidraw0", "-n", "off"]).is_ok());
         assert_eq!(
-            execute(&cli, &[]).unwrap_err().to_string(),
+            run_args(&["-n", "mode"]).unwrap_err(),
             "'mode' needs a mode name"
         );
-        let cli = parse(&["-n", "-z", "bogus", "on"]).unwrap();
-        assert!(execute(&cli, &[])
+        assert!(run_args(&["-n", "-z", "bogus", "on"])
             .unwrap_err()
-            .to_string()
             .starts_with("unknown zone 'bogus'"));
+        // Checked before anything else, even before the device is looked up.
+        assert_eq!(
+            run_args(&["--device", "/nonexistent/hidraw0", "on", "extra"]).unwrap_err(),
+            "'on' takes no mode name (got 'extra')"
+        );
+        assert_eq!(
+            run_args(&["status", "x"]).unwrap_err(),
+            "'status' takes no mode name (got 'x')"
+        );
+    }
+
+    #[test]
+    fn permission_denied_explains_the_udev_rule() {
+        use std::os::unix::fs::PermissionsExt;
+        // root opens any file, so the check below would be meaningless.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let t = TempTree::new();
+        let node = t.0.join("dev/hidraw0");
+        fs::write(&node, b"").unwrap();
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o000)).unwrap();
+        let path = node.to_str().unwrap();
+        let err = run(parse(&["--device", path, "off"]).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("permission denied"), "got {err}");
+        assert!(
+            err.contains("60-evga-led.rules") && err.contains(UDEV_RULE),
+            "got {err}"
+        );
+        let err = run(parse(&["--device", path, "status"]).unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(UDEV_RULE), "got {err}");
     }
 
     #[test]
@@ -673,44 +653,6 @@ mod tests {
             status_lines(&state)[0],
             "last command: zone=0x00 (none) response=0x0"
         );
-    }
-
-    #[test]
-    fn container_command_reruns_binary_with_guard_and_device() {
-        let argv = ["--device", "hidraw3", "-z", "onboard", "off"].map(OsString::from);
-        let cmd = container_command(
-            Path::new("/opt/evga-led"),
-            "img:tag",
-            Path::new("/dev/hidraw3"),
-            &argv,
-        );
-        assert_eq!(cmd.get_program(), "docker");
-        let args: Vec<&OsStr> = cmd.get_args().collect();
-        let expected = [
-            "run",
-            "--rm",
-            "--device",
-            "/dev/hidraw3",
-            "-v",
-            "/opt/evga-led:/evga-led:ro",
-            "-e",
-            "EVGA_LED_IN_CONTAINER=1",
-            "--entrypoint",
-            "/evga-led",
-            "img:tag",
-            "--device",
-            "hidraw3",
-            "-z",
-            "onboard",
-            "off",
-            "--device",
-            "/dev/hidraw3",
-        ];
-        assert_eq!(args, expected.map(OsStr::new));
-        // Inside the container, the mapped absolute node wins over the user's relative one.
-        let inner: Vec<&OsStr> = args[10..].to_vec();
-        let cli = Cli::try_parse_from(inner).unwrap();
-        assert_eq!(cli.device.as_deref(), Some(Path::new("/dev/hidraw3")));
     }
 
     #[test]
