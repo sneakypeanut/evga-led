@@ -1,0 +1,4 @@
+# EVGA Z790 CLASSIFIED onboard ARGB (USB 3842:300e "EVGA 5516 MCU AP").
+# Lets the logged-in user talk to the LED controller's HID feature reports
+# without root. Reads reports (status) and writes them (mode changes).
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3842", ATTRS{idProduct}=="300e", TAG+="uaccess"
