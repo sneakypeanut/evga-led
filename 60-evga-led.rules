@@ -1,3 +1,5 @@
+# Rule numbered below 73-seat-late.rules: udev only processes the uaccess TAG
+# before that point, so a 99- rule would install cleanly and never grant access.
 # EVGA Z790 CLASSIFIED onboard ARGB (USB 3842:300e "EVGA 5516 MCU AP").
 # Lets the logged-in user talk to the LED controller's HID feature reports
 # without root. Reads reports (status) and writes them (mode changes).

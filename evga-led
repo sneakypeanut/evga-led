@@ -57,6 +57,9 @@ SUB_WRITE, SUB_READ = 0, 1
 RESPONSE = {0xC0: "Success", 0xC1: "Fail", 0xC2: "InProcess"}
 VENDOR_PRODUCT = "00003842:0000300E"
 DOCKER_IMAGE = os.environ.get("EVGA_LED_IMAGE", "python:3-slim")
+# The interpreter inside that image. Do not hardcode an application venv path:
+# a stock python image has no /app/.venv.
+DOCKER_PYTHON = os.environ.get("EVGA_LED_PYTHON", "python3")
 
 ZONE_ORDER = [("argb1", 1), ("argb2", 2), ("argb3", 4), ("argb4", 8), ("cover", 16)]
 ZONE_ALIASES = {"all": 31, "onboard": 16, "cover": 16}
@@ -138,10 +141,11 @@ def reopen_via_docker(path: str, argv: list[str]) -> int:
     cmd = [
         "docker", "run", "--rm", "--device", path,
         "-v", f"{os.path.realpath(__file__)}:/evga-led:ro",
-        "--entrypoint", "/app/.venv/bin/python",
+        "--entrypoint", DOCKER_PYTHON,
         DOCKER_IMAGE, "/evga-led", "--device", path, *argv,
     ]
-    print(f"(using a container for device access: {DOCKER_IMAGE})", file=sys.stderr)
+    print(f"(using a container for device access: {DOCKER_IMAGE}, "
+          f"{DOCKER_PYTHON})", file=sys.stderr)
     return subprocess.call(cmd)
 
 

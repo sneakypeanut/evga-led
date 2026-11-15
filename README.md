@@ -32,9 +32,13 @@ A kernel driver is *not* needed; this talks to the HID feature report via
 install -m755 evga-led ~/.local/bin/evga-led
 
 # let your user (not root) open the hidraw node:
-sudo install -m644 99-evga-led.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger
+sudo install -m644 60-evga-led.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
 ```
+
+The rule **must** be numbered below `73-seat-late.rules` (hence `60-`): udev only
+acts on the `uaccess` tag before that point, so a `99-` rule installs cleanly and
+silently grants nothing.
 
 If you would rather not install a udev rule, `evga-led` falls back to running
 itself inside a container with `--device` access (docker group = root-equivalent):
