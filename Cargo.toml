@@ -1,0 +1,17 @@
+[package]
+name = "evga-z790-tools"
+version = "0.1.0"
+edition = "2021"
+description = "Linux LED and fan controller tools for the EVGA Z790 CLASSIFIED"
+license = "MIT"
+repository = "https://github.com/sneakypeanut/evga-z790-tools"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+strip = true

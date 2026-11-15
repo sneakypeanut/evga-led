@@ -1,6 +1,6 @@
 # evga-z790-tools
 
-Linux control for the **EVGA Z790 CLASSIFIED**'s two independent embedded
+Rust tools for Linux control of the **EVGA Z790 CLASSIFIED**'s two independent embedded
 controllers — its ARGB lighting and its fan controller. No Windows, no EVGA
 ELEET X1, no vendor driver.
 
@@ -44,11 +44,17 @@ modes:    off on breathing rainbow pulse rainbowwave wave star colorstack
 ## Install
 
 ```bash
-install -m755 evga-led ~/.local/bin/evga-led
+# Build all four native binaries (Rust stable on Linux):
+cargo build --release --locked
+install -Dm755 target/release/evga-led ~/.local/bin/evga-led
+install -Dm755 target/release/evga-fan ~/.local/bin/evga-fan
+install -Dm755 target/release/evga-fan-probe ~/.local/bin/evga-fan-probe
+install -Dm755 target/release/evga-fan-sweep ~/.local/bin/evga-fan-sweep
 
 # let your user (not root) open the hidraw node:
-sudo install -m644 60-evga-led.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=hidraw
+pkexec install -m644 "$PWD/60-evga-led.rules" /etc/udev/rules.d/
+pkexec udevadm control --reload
+pkexec udevadm trigger --subsystem-match=hidraw
 ```
 
 The rule **must** be numbered below `73-seat-late.rules` (hence `60-`): udev only
@@ -56,10 +62,14 @@ acts on the `uaccess` tag before that point, so a `99-` rule installs cleanly an
 silently grants nothing.
 
 Without the rule, `evga-led` falls back to running itself in a container with
-`--device` access (docker group = root-equivalent):
+`--device` access (docker group = root-equivalent). It mounts and executes the
+native binary; no Python interpreter is used. The default image is
+`archlinux:base`. Override it with `EVGA_LED_IMAGE` if needed; the image must
+provide a compatible dynamic loader and glibc for your build. The old
+`EVGA_LED_PYTHON` setting is no longer used.
 
 ```bash
-EVGA_LED_IMAGE=python:3-slim evga-led off
+evga-led off
 ```
 
 ## Protocol
@@ -125,17 +135,51 @@ evga-fan restore [FILE]    write both pages back verbatim
 Fans 0–7 correspond to the board's fan headers; headers with nothing plugged in
 read `0 RPM` and are skipped by `quiet`.
 
+The Rust tools replace the Python scripts. LED command names and frame bytes
+remain compatible; fan backups retain the `acpi` and `smartfan` JSON arrays so
+existing backups can be restored. The Rust fan commands validate input before
+accessing the EC and save a backup before changing its configuration.
+
+`quiet` now starts at 45% duty rather than the Python preset's 25%, keeping ten
+percentage points above the observed 35% stall threshold. A different fan may
+need a higher floor. Custom curves must use nondecreasing temperatures and duties,
+with full duty by 70 °C and a minimum of 35%. Restore is a verbatim recovery
+operation and can reapply curves below these limits.
+
+`evga-fan-probe` prints EC identity and detailed fan state. `evga-fan-sweep [FAN]`
+measures a fan's low-duty behavior and settles a curve above the measured floor;
+it deliberately tries duties as low as 20% and should be run only while watching
+temperatures. An I/O failure triggers an attempt to restore the original curve;
+forced termination or power loss can leave the last curve active. The pre-sweep
+backup remains available for recovery.
+
+Sweep treats the EC's `Current_PWM` reading as a percentage, following the
+original tool. Its scale has not been verified on hardware; a raw reading above
+100 aborts the sweep and triggers an attempt to restore the original curve.
+Check the probe's readings before using sweep to tune a fan.
+
 ## Root is required
 
 `evga-fan` writes I/O ports `0x4E`/`0x4F` through `/dev/port`, which needs
 `CAP_SYS_RAWIO`. There is deliberately no udev rule for this: a `kmem` ACL for a
-normal user is a much larger hole than a hidraw node. Run it with `sudo`, or from
-a privileged container:
+normal user is a much larger hole than a hidraw node. Run the native binary with `pkexec`:
 
 ```bash
-docker run --rm --privileged -v "$HOME:/host" -e HOME=/host \
-  --entrypoint python3 python:3-slim /host/.local/bin/evga-fan show
+pkexec "$HOME/.local/bin/evga-fan" show
 ```
+
+The state directory follows the process's `HOME` or `EVGA_FAN_STATE`. `pkexec`
+uses the target user's environment, so the default for a root invocation is
+normally `/root/.local/state/evga-fan/`. To choose an explicit backup directory:
+
+```bash
+pkexec env EVGA_FAN_STATE="$HOME/.local/state/evga-fan" \
+  "$HOME/.local/bin/evga-fan" backup
+```
+
+Use the same directory for later commands, or give `restore` an absolute backup
+path. Restore rejects backups without full EC pages and an EVGA vendor ID;
+it still restores the page bytes verbatim, including any manual fan settings.
 
 ## Protocol
 
@@ -179,7 +223,7 @@ Page `0xC7` (`SmartFanProtocol`):
   them back. Do this before any curve edit.
 - **Never set a duty below a fan's stall floor.** Measured on this board: one fan
   stops entirely at 20–30% and only spins from 35% up. A stalled fan reads `0 RPM`
-  and silently provides no cooling. Sweep with `fan_sweep.py` to find the floor per
+  and silently provides no cooling. Sweep with `evga-fan-sweep` to find the floor per
   fan, then sit ≥10 points above it.
 - **Always keep 100% by ~70 °C.** Soften only the low end of the curve; leave the
   top end intact so load behaviour is unchanged.
@@ -193,14 +237,27 @@ Page `0xC7` (`SmartFanProtocol`):
 ## Repository layout
 
 ```
-evga-led                 ARGB tool (installed to ~/.local/bin)
-60-evga-led.rules        udev rule: hidraw uaccess for 3842:300e
-fan/fan_ctl.py           fan tool (installed as evga-fan)
-fan/fan_probe.py         read-only EC dump: IDs, RPM, PWM, curves
-fan/fan_sweep.py         find a fan's stall floor, then settle a safe curve
+src/led.rs              ARGB protocol, HID transport, CLI
+src/fan.rs              EC transport, fan control, probe and sweep
+src/bin/                evga-led, evga-fan, evga-fan-probe, evga-fan-sweep
+tests/                  CLI checks and Python-derived LED parity fixtures
+60-evga-led.rules       udev rule: hidraw uaccess for 3842:300e
 ```
 
 ## Notes
+
+Development checks (no hardware required):
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+```
+
+CLI tests compare all 77 mode/zone alias combinations against dry-run output
+captured from the original Python implementation. Unit tests cover the hardware
+protocols with simulated transports. Passing these checks does not establish
+that the Rust binaries have been tested on the physical board.
 
 - Unofficial and unaffiliated with EVGA. These tools write undocumented vendor
   protocols. The fan path touches live cooling configuration — keep a backup and
