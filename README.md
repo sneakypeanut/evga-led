@@ -103,8 +103,10 @@ data `0` = dark, `1` = lit. Not yet exposed as a CLI flag.
   (which declares only IDs 3–8) stalls the request with `EPIPE`.
 - A SET on **report ID 0 of the other interface** (`hidraw5`) can wedge the LED
   interface until a `USBDEVFS_RESET` (`0x5514`) on `/dev/bus/usb/BBB/DDD`.
-- **A USB reset restores the MCU's default lighting.** Reset only when wedged, and
-  re-send the desired state afterwards.
+- **LED state survives a USB reset.** After a `USBDEVFS_RESET` the onboard
+  "Z790 | CLASSIFIED" text stayed off and the MCU still reported the last command
+  for all zones (BIOS 1.20, Nov 2026; ARGB1–4 headers had nothing attached, so
+  only their reported state was checked). Reset only when wedged.
 - Report ID 7 lives on only one of the two HID interfaces — the tool picks it by
   scanning `report_descriptor` for `85 07`.
 
