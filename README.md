@@ -42,7 +42,9 @@ modes:    off on breathing rainbow pulse rainbowwave wave star colorstack
 
 With no action, `evga led` shows status.
 
-`-n/--dry-run` prints the exact 226-byte frame without touching the device.
+`-n/--dry-run` prints the 226-byte zone-mode frame without touching the device.
+Non-off modes also clear the controller's separate global dark-mode gate during
+a real write. `off` only disables the selected zones and leaves that gate alone.
 
 ## Install
 
@@ -99,8 +101,20 @@ Modes: `0` StaticOff, `1` StaticOn, `2` Breathing, `3` Rainbow, `4` Pulse,
 Everything off (checksum `0xED`): `07 ea 02 01 00 00 00 ed 1f ...`
 
 The same MCU also has a **global dark mode** on report ID 4
-(`Data1Report`: 7-byte command + data + 9 reserved), `GeneralMainCommand.LEDDarkMode = 80`,
-data `0` = dark, `1` = lit. Not yet exposed as a CLI flag.
+(`Data1Report`: 7-byte command including the report ID + data + 9 reserved;
+17 bytes total), `GeneralMainCommand.LEDDarkMode = 80` (`0x50`). Data at byte 7:
+`0` = dark, `1` = lit. Subcommand at byte 4: `0` = write, `1` = read.
+This report has no checksum field; byte 7 is data, unlike the zone-mode report.
+
+Clearing global dark mode uses `04 ea 02 50 00 00 00 01` followed by nine zeros.
+`evga led on` and other non-off modes do this automatically after setting the
+selected zone modes. Without this step the controller can acknowledge all zones
+as "on" while the physical LEDs remain dark. This behavior was reproduced and
+clearing the gate was visually confirmed on the Z790 CLASSIFIED.
+
+`evga led status` queries both the global gate and current zone modes. A plain
+GET only returns the last command; reading current state requires a SET carrying
+the read subcommand, followed by a GET with the correct report ID.
 
 ## Firmware quirks
 

@@ -32,6 +32,10 @@
 //! * A SET on report ID 0 of the *other* interface (hidraw5) can wedge the LED
 //!   interface until a USBDEVFS_RESET (0x5514) on the USB device.
 //! * LED state survives a USB reset and reboots while standby power is present.
+//! * Report 4 `LEDDarkMode` (0x50) is a global switch over every zone: with
+//!   data 0 (dark) report 7 still answers Success but nothing lights. ELeet X1's
+//!   "RGB On" toggle writes data 1; reading it is a SET with subcommand 1 then
+//!   a GET (`Data1Report`: 7-byte command, data byte, 9 reserved, no checksum).
 //!
 //! Access: `/dev/hidrawN` is root-only. Install
 //! `SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3842", ATTRS{idProduct}=="300e", TAG+="uaccess"`
@@ -57,6 +61,16 @@ pub const SUB_READ: u8 = 1;
 const VENDOR_PRODUCT: &str = "00003842:0000300E";
 /// `85 07` in a HID report descriptor: Report ID 7.
 const REPORT7_TAG: [u8; 2] = [0x85, 0x07];
+/// Report 4 carries the general commands, including the global LED switch.
+pub const GENERAL_REPORT_ID: u8 = 0x04;
+pub const GENERAL_LEN: usize = 17;
+/// `GeneralMainCommand.LEDDarkMode`: data 0 = dark (every zone off), 1 = lit.
+pub const MAIN_LED_DARK_MODE: u8 = 0x50;
+const RESP_SUCCESS: u8 = 0xC0;
+const RESP_IN_PROCESS: u8 = 0xC2;
+/// ELeet X1 waits 5 ms between the SET and the GET of every command.
+const SET_GET_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+const IN_PROCESS_RETRIES: usize = 10;
 const UDEV_RULE: &str =
     r#"SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3842", ATTRS{idProduct}=="300e", TAG+="uaccess""#;
 
@@ -301,15 +315,140 @@ fn open_node(path: &Path) -> Result<File> {
         })
 }
 
-fn feature_ioctl(file: &File, request: u32, buf: &mut [u8; BUFLEN]) -> io::Result<()> {
-    // SAFETY: `buf` is a live, writable BUFLEN-byte buffer, matching the size
-    // encoded in `request`.
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), request as _, buf.as_mut_ptr()) };
-    if rc < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+/// HID feature-report transport: the hidraw node, or a model in tests.
+trait Feature {
+    fn set_feature(&mut self, buf: &mut [u8]) -> io::Result<()>;
+    /// `buf[0]` names the report ID to fetch.
+    fn get_feature(&mut self, buf: &mut [u8]) -> io::Result<()>;
+}
+
+struct Hidraw(File);
+
+impl Hidraw {
+    /// Returns the byte count the hidraw ioctl reports.
+    fn ioctl(&self, request: u32, buf: &mut [u8]) -> io::Result<usize> {
+        // SAFETY: `buf` is a live, writable buffer of exactly the length
+        // encoded in `request`.
+        let rc = unsafe { libc::ioctl(self.0.as_raw_fd(), request as _, buf.as_mut_ptr()) };
+        usize::try_from(rc).map_err(|_| io::Error::last_os_error())
     }
+}
+
+/// A transfer is only usable in full: a short GET would leave zeros that
+/// read as data (dark switch, mode off).
+fn require_full(count: usize, len: usize) -> io::Result<()> {
+    if count == len {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("short transfer: {count} of {len} bytes"),
+        ))
+    }
+}
+
+impl Feature for Hidraw {
+    fn set_feature(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        let count = self.ioctl(hidiocsfeature(buf.len()), buf)?;
+        require_full(count, buf.len())
+    }
+
+    fn get_feature(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        let count = self.ioctl(hidiocgfeature(buf.len()), buf)?;
+        require_full(count, buf.len())
+    }
+}
+
+/// Build a report-4 `Data1Report`: the 7-byte general command, one data byte
+/// and 9 reserved bytes. Unlike report 7 it carries no checksum.
+pub fn build_general_frame(main: u8, sub: u8, data: u8) -> [u8; GENERAL_LEN] {
+    let mut buf = [0u8; GENERAL_LEN];
+    buf[..5].copy_from_slice(&[GENERAL_REPORT_ID, HEADER1, HEADER2, main, sub]);
+    buf[7] = data;
+    buf
+}
+
+/// The vendor's `SetAndGetFeature(ref s, 5)`: SET `frame`, wait 5 ms, GET the
+/// same report ID, and check that the reply echoes the command header. A
+/// `Success` reply replaces `frame`; `InProcess` is re-read a bounded number of
+/// times; anything else is an error.
+fn transact<D: Feature>(dev: &mut D, frame: &mut [u8]) -> Result<()> {
+    let id = frame[0];
+    dev.set_feature(frame)
+        .map_err(|e| format!("SET failed: {}", errno_name(&e)))?;
+    let mut reply = vec![0u8; frame.len()];
+    for _ in 0..=IN_PROCESS_RETRIES {
+        std::thread::sleep(SET_GET_DELAY);
+        reply.fill(0);
+        reply[0] = id; // hidraw reads the requested report ID from here
+        dev.get_feature(&mut reply)
+            .map_err(|e| format!("report {id} read-back failed: {}", errno_name(&e)))?;
+        if reply[..6] != frame[..6] {
+            return Err(format!(
+                "report {id}: reply {} does not echo command {}",
+                hex_bytes(&reply[..7]),
+                hex_bytes(&frame[..6])
+            )
+            .into());
+        }
+        match reply[6] {
+            RESP_SUCCESS => {
+                frame.copy_from_slice(&reply);
+                return Ok(());
+            }
+            RESP_IN_PROCESS => continue,
+            code => {
+                return Err(format!(
+                    "report {id} command 0x{:02X}: device answered {}",
+                    frame[3],
+                    response_name(code)
+                )
+                .into())
+            }
+        }
+    }
+    Err(format!(
+        "report {id} command 0x{:02X}: still InProcess after {} reads",
+        frame[3],
+        IN_PROCESS_RETRIES + 1
+    )
+    .into())
+}
+
+/// Read the global LED switch (report 4 `LEDDarkMode`); `true` means dark.
+fn read_dark<D: Feature>(dev: &mut D) -> Result<bool> {
+    let mut frame = build_general_frame(MAIN_LED_DARK_MODE, SUB_READ, 0);
+    transact(dev, &mut frame)?;
+    match frame[7] {
+        0 => Ok(true),
+        1 => Ok(false),
+        other => Err(format!(
+            "global LED switch (report 4 LEDDarkMode) reads {other}, expected 0 or 1"
+        )
+        .into()),
+    }
+}
+
+/// Turn the global LED switch on, as ELeet X1's "RGB On" toggle does, and
+/// confirm it took.
+fn clear_dark<D: Feature>(dev: &mut D) -> Result<()> {
+    let mut frame = build_general_frame(MAIN_LED_DARK_MODE, SUB_WRITE, 1);
+    transact(dev, &mut frame)?;
+    if read_dark(dev)? {
+        return Err(
+            "global LED switch (report 4 LEDDarkMode) still reads dark after turning it on".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Read every zone's actual mode with a report-7 LightEffect Read query.
+fn read_zone_modes<D: Feature>(dev: &mut D) -> Result<[u8; 5]> {
+    let mut frame = build_frame(0, 0, SUB_READ);
+    transact(dev, &mut frame)?;
+    let mut modes = [0u8; 5];
+    modes.copy_from_slice(&frame[9..14]);
+    Ok(modes)
 }
 
 /// Symbolic errno name like Python's `errno.errorcode`, else the number.
@@ -342,26 +481,6 @@ fn errno_name(err: &io::Error) -> String {
     name.into()
 }
 
-/// GET report 7: the MCU echoes its last command frame.
-fn read_state(path: &Path) -> Option<[u8; BUFLEN]> {
-    let file = match open_node(path) {
-        Ok(file) => file,
-        Err(e) => {
-            println!("read-back unavailable ({e})");
-            return None;
-        }
-    };
-    let mut buf = [0u8; BUFLEN];
-    buf[0] = REPORT_ID; // hidraw reads the requested report ID from here
-    match feature_ioctl(&file, hidiocgfeature(BUFLEN), &mut buf) {
-        Ok(()) => Some(buf),
-        Err(e) => {
-            println!("read-back failed: {}", errno_name(&e));
-            None
-        }
-    }
-}
-
 fn hex_bytes(bytes: &[u8]) -> String {
     let parts: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
     parts.join(" ")
@@ -388,60 +507,61 @@ fn read_back_line(state: &[u8; BUFLEN]) -> String {
     )
 }
 
-fn status_lines(state: &[u8; BUFLEN]) -> Vec<String> {
-    let zones: Vec<&str> = ZONE_ORDER
-        .iter()
-        .filter(|&&(_, bit)| state[8] & bit != 0)
-        .map(|&(name, _)| name)
-        .collect();
-    let zones = if zones.is_empty() {
-        "none".to_string()
+fn status_lines(dark: bool, modes: &[u8; 5]) -> Vec<String> {
+    let mut lines = vec![if dark {
+        "global LED switch: dark (all zones forced off; run `evga led on` to enable lights)"
+            .to_string()
     } else {
-        zones.join(", ")
-    };
-    let mut lines = vec![format!(
-        "last command: zone=0x{:02X} ({zones}) response={}",
-        state[8],
-        response_name(state[6])
-    )];
-    for (idx, &(name, _)) in ZONE_ORDER.iter().enumerate() {
-        lines.push(format!("  {name:6} {}", mode_name(state[9 + idx])));
+        "global LED switch: lit".to_string()
+    }];
+    lines.push("zone modes (read from the MCU):".to_string());
+    for (&(name, _), &mode) in ZONE_ORDER.iter().zip(modes) {
+        lines.push(format!("  {name:6} {}", mode_name(mode)));
     }
     lines
 }
 
 fn do_set(path: Option<&Path>, zone: u8, mode: u8) -> Result<()> {
-    let mut frame = build_frame(zone, mode, SUB_WRITE);
     let Some(path) = path else {
+        let frame = build_frame(zone, mode, SUB_WRITE);
         for line in dry_run_lines(zone, mode, &frame) {
             println!("{line}");
         }
         return Ok(());
     };
+    set_zones(&mut Hidraw(open_node(path)?), zone, mode)
+}
 
-    let file = open_node(path)?;
+/// Write `mode` to the zones in `zone`. A nonzero mode also turns the global
+/// LED switch on when it is dark, since a dark switch overrides every zone;
+/// mode 0 never touches the switch, so other zones keep their state.
+fn set_zones<D: Feature>(dev: &mut D, zone: u8, mode: u8) -> Result<()> {
+    let mut frame = build_frame(zone, mode, SUB_WRITE);
     let checksum = frame[7];
-    feature_ioctl(&file, hidiocsfeature(BUFLEN), &mut frame)
-        .map_err(|e| format!("SET failed: {}", errno_name(&e)))?;
-    drop(file);
-
+    transact(dev, &mut frame)?;
     println!(
         "sent: zone 0x{zone:02X} -> {} (checksum 0x{checksum:02X})",
         mode_name(mode)
     );
-    if let Some(state) = read_state(path) {
-        println!("{}", read_back_line(&state));
+    println!("{}", read_back_line(&frame));
+    if mode != 0 && read_dark(dev)? {
+        clear_dark(dev)?;
+        println!("global LED switch: was dark, now lit");
     }
     Ok(())
 }
 
 fn do_status(path: &Path) -> Result<()> {
-    drop(open_node(path)?);
-    let state = read_state(path).ok_or("status read failed")?;
-    for line in status_lines(&state) {
+    for line in status_report(&mut Hidraw(open_node(path)?))? {
         println!("{line}");
     }
     Ok(())
+}
+
+fn status_report<D: Feature>(dev: &mut D) -> Result<Vec<String>> {
+    let dark = read_dark(dev)?;
+    let modes = read_zone_modes(dev)?;
+    Ok(status_lines(dark, &modes))
 }
 
 fn do_detect(path: &Path) -> Result<()> {
@@ -637,9 +757,10 @@ mod tests {
             "read back: zone=0x11 modes=[2, 0, 0, 0, 12] response=Success"
         );
         assert_eq!(
-            status_lines(&state),
+            status_lines(true, &[2, 0, 0, 0, 12]),
             [
-                "last command: zone=0x11 (argb1, cover) response=Success",
+                "global LED switch: dark (all zones forced off; run `evga led on` to enable lights)",
+                "zone modes (read from the MCU):",
                 "  argb1  breathing",
                 "  argb2  off",
                 "  argb3  off",
@@ -647,12 +768,239 @@ mod tests {
                 "  cover  12",
             ]
         );
-        state[8] = 0;
-        state[6] = 0;
+        assert_eq!(status_lines(false, &[0; 5])[0], "global LED switch: lit");
+    }
+
+    #[test]
+    fn short_transfers_are_errors() {
+        assert!(require_full(GENERAL_LEN, GENERAL_LEN).is_ok());
+        assert!(require_full(BUFLEN, BUFLEN).is_ok());
+        let err = require_full(7, GENERAL_LEN).unwrap_err();
+        assert_eq!(err.to_string(), "short transfer: 7 of 17 bytes");
+        assert!(require_full(0, BUFLEN).is_err());
+    }
+
+    #[test]
+    fn report4_frames_match_vendor_data1report() {
+        // Data1Report: 04 EA 02 <main> <sub1> <sub2> <resp> <data> + 9 reserved,
+        // no checksum. Bytes Hamdi sent live to light the board, and the query.
         assert_eq!(
-            status_lines(&state)[0],
-            "last command: zone=0x00 (none) response=0x0"
+            build_general_frame(MAIN_LED_DARK_MODE, SUB_WRITE, 1),
+            [4, 0xEA, 2, 0x50, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
+        assert_eq!(
+            build_general_frame(MAIN_LED_DARK_MODE, SUB_READ, 0),
+            [4, 0xEA, 2, 0x50, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        // _IOC(3, 'H', 6/7, 17)
+        assert_eq!(hidiocsfeature(GENERAL_LEN), 0xC011_4806);
+        assert_eq!(hidiocgfeature(GENERAL_LEN), 0xC011_4807);
+        // The report-7 zone query captured live: 07 ea 02 01 01 00 00 0b 00 ...
+        let q = build_frame(0, 0, SUB_READ);
+        assert_eq!(&q[..9], &[7, 0xEA, 2, 1, 1, 0, 0, 0x0B, 0]);
+    }
+
+    /// Model of the LED MCU's two feature reports, answering the way the board
+    /// did live: a GET returns the reply to the last SET of that report ID.
+    #[derive(Default)]
+    struct Mcu {
+        dark: bool,
+        modes: [u8; 5],
+        replies: std::collections::HashMap<u8, Vec<u8>>,
+        sets: Vec<Vec<u8>>,
+        /// Answer InProcess to this many GETs before the real reply.
+        in_process: usize,
+        /// Force this response byte on every reply to a SET of report 7.
+        report7_response: Option<u8>,
+        /// Echo a different main command on report 7 replies.
+        garble_report7: bool,
+        /// Ignore writes to the global switch.
+        stuck_dark: bool,
+        /// Report this data byte for the switch instead of 0/1.
+        dark_data: Option<u8>,
+        /// Echo a nonzero subcommand 2 on every reply.
+        garble_sub2: bool,
+    }
+
+    impl Mcu {
+        fn dark_writes(&self) -> Vec<u8> {
+            self.sets
+                .iter()
+                .filter(|f| {
+                    f[0] == GENERAL_REPORT_ID && f[3] == MAIN_LED_DARK_MODE && f[4] == SUB_WRITE
+                })
+                .map(|f| f[7])
+                .collect()
+        }
+    }
+
+    impl Feature for Mcu {
+        fn set_feature(&mut self, buf: &mut [u8]) -> io::Result<()> {
+            self.sets.push(buf.to_vec());
+            let mut reply = buf.to_vec();
+            reply[6] = RESP_SUCCESS;
+            match (buf[0], buf[3], buf[4]) {
+                (REPORT_ID, MAIN_LIGHT_EFFECT, SUB_WRITE) => {
+                    for (idx, &(_, bit)) in ZONE_ORDER.iter().enumerate() {
+                        if buf[8] & bit != 0 {
+                            self.modes[idx] = buf[9 + idx];
+                        }
+                    }
+                    if let Some(code) = self.report7_response {
+                        reply[6] = code;
+                    }
+                    if self.garble_report7 {
+                        reply[3] = 0x05;
+                    }
+                }
+                (REPORT_ID, MAIN_LIGHT_EFFECT, SUB_READ) => {
+                    reply[9..14].copy_from_slice(&self.modes);
+                    reply[7] = 0x46; // the device fills its own checksum
+                }
+                (GENERAL_REPORT_ID, MAIN_LED_DARK_MODE, SUB_WRITE) => {
+                    if !self.stuck_dark {
+                        self.dark = buf[7] == 0;
+                    }
+                }
+                (GENERAL_REPORT_ID, MAIN_LED_DARK_MODE, SUB_READ) => {
+                    reply[7] = self.dark_data.unwrap_or(u8::from(!self.dark));
+                }
+                _ => reply[6] = 0xC1,
+            }
+            if self.garble_sub2 {
+                reply[5] = 1;
+            }
+            self.replies.insert(buf[0], reply);
+            Ok(())
+        }
+
+        fn get_feature(&mut self, buf: &mut [u8]) -> io::Result<()> {
+            let reply = self
+                .replies
+                .get(&buf[0])
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EPIPE))?;
+            buf.copy_from_slice(reply);
+            if self.in_process > 0 {
+                self.in_process -= 1;
+                buf[6] = RESP_IN_PROCESS;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn nonzero_mode_turns_a_dark_global_switch_on() {
+        let mut mcu = Mcu {
+            dark: true,
+            ..Mcu::default()
+        };
+        set_zones(&mut mcu, 16, 1).unwrap();
+        assert_eq!(mcu.modes, [0, 0, 0, 0, 1]);
+        assert!(!mcu.dark, "switch must be lit after `on`");
+        assert_eq!(mcu.dark_writes(), [1]);
+        // The zone write happens before the switch is touched.
+        assert_eq!(mcu.sets[0][0], REPORT_ID);
+    }
+
+    #[test]
+    fn lit_switch_is_left_alone_and_off_never_touches_it() {
+        let mut mcu = Mcu::default();
+        set_zones(&mut mcu, 31, 3).unwrap();
+        assert!(mcu.dark_writes().is_empty(), "already lit: no switch write");
+
+        for dark in [false, true] {
+            let mut mcu = Mcu {
+                dark,
+                modes: [1; 5],
+                ..Mcu::default()
+            };
+            set_zones(&mut mcu, 16, 0).unwrap();
+            assert_eq!(mcu.modes, [1, 1, 1, 1, 0], "other zones keep their mode");
+            assert_eq!(mcu.dark, dark);
+            assert!(
+                mcu.sets.iter().all(|f| f[0] == REPORT_ID),
+                "mode 0 must not read or write report 4"
+            );
+        }
+    }
+
+    #[test]
+    fn status_reads_the_switch_and_real_zone_modes() {
+        let mut mcu = Mcu {
+            dark: true,
+            modes: [2, 0, 0, 0, 1],
+            ..Mcu::default()
+        };
+        let lines = status_report(&mut mcu).unwrap();
+        assert!(lines[0].contains("dark"), "{lines:?}");
+        assert_eq!(lines[2], "  argb1  breathing");
+        assert_eq!(lines[6], "  cover  on");
+        // Queries only: nothing was written to a zone or the switch.
+        assert!(mcu.sets.iter().all(|f| f[4] == SUB_READ));
+        assert!(mcu.dark);
+    }
+
+    #[test]
+    fn in_process_is_retried_within_a_bound() {
+        let mut mcu = Mcu {
+            dark: true,
+            in_process: 3,
+            ..Mcu::default()
+        };
+        set_zones(&mut mcu, 31, 1).unwrap();
+        assert!(!mcu.dark);
+
+        let mut mcu = Mcu {
+            in_process: usize::MAX,
+            ..Mcu::default()
+        };
+        let err = set_zones(&mut mcu, 31, 1).unwrap_err().to_string();
+        assert!(err.contains("still InProcess"), "{err}");
+    }
+
+    #[test]
+    fn failed_or_malformed_replies_are_errors_not_success() {
+        let mut mcu = Mcu {
+            dark: true,
+            report7_response: Some(0xC1),
+            ..Mcu::default()
+        };
+        let err = set_zones(&mut mcu, 31, 1).unwrap_err().to_string();
+        assert!(err.contains("Fail"), "{err}");
+        assert!(
+            mcu.dark_writes().is_empty(),
+            "no switch write after a failed zone write"
+        );
+
+        let mut mcu = Mcu {
+            dark: true,
+            garble_report7: true,
+            ..Mcu::default()
+        };
+        let err = set_zones(&mut mcu, 31, 1).unwrap_err().to_string();
+        assert!(err.contains("does not echo"), "{err}");
+
+        let mut mcu = Mcu {
+            dark_data: Some(2),
+            ..Mcu::default()
+        };
+        let err = status_report(&mut mcu).unwrap_err().to_string();
+        assert!(err.contains("reads 2, expected 0 or 1"), "{err}");
+
+        let mut mcu = Mcu {
+            garble_sub2: true,
+            ..Mcu::default()
+        };
+        let err = status_report(&mut mcu).unwrap_err().to_string();
+        assert!(err.contains("does not echo"), "{err}");
+
+        let mut mcu = Mcu {
+            dark: true,
+            stuck_dark: true,
+            ..Mcu::default()
+        };
+        let err = set_zones(&mut mcu, 31, 1).unwrap_err().to_string();
+        assert!(err.contains("still reads dark"), "{err}");
     }
 
     #[test]
