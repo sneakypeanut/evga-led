@@ -155,9 +155,8 @@ def read_state(path: str, tries: int = 4, delay: float = 0.25) -> bytearray | No
     for _ in range(tries):
         fd = _open(path)
         if fd < 0:
-            last = "permission denied"
-            time.sleep(delay)
-            continue
+            print("read-back unavailable (permission denied on the hidraw node)")
+            return None
         try:
             buf = bytearray(BUFLEN)
             fcntl.ioctl(fd, HIDIOCGFEATURE(BUFLEN), buf, True)
@@ -171,7 +170,7 @@ def read_state(path: str, tries: int = 4, delay: float = 0.25) -> bytearray | No
     return None
 
 
-def do_set(path: str, zone: int, mode: int, dry_run: bool) -> int:
+def do_set(path: str | None, zone: int, mode: int, dry_run: bool) -> int:
     frame = build_frame(zone, mode)
     if dry_run:
         print(f"zone=0x{zone:02X} mode={mode} checksum=0x{frame[7]:02X}")
@@ -202,6 +201,10 @@ def do_set(path: str, zone: int, mode: int, dry_run: bool) -> int:
 
 
 def do_status(path: str) -> int:
+    fd = _open(path)
+    if fd < 0:
+        return reopen_via_docker(path, sys.argv[1:])
+    os.close(fd)
     state = read_state(path)
     if state is None:
         return 1
@@ -223,22 +226,24 @@ def main(argv: list[str]) -> int:
                     help="all | onboard | argb1..argb4 (default: all)")
     ap.add_argument("-n", "--dry-run", action="store_true")
     args = ap.parse_args(argv)
-
-    path = find_device(args.device)
+    if args.mode and args.action != "mode":
+        ap.error(f"'{args.action}' takes no mode name (got '{args.mode}')")
 
     if args.action == "detect":
+        path = find_device(args.device)
         print(f"device: {path}")
         try:
             desc = Path(
                 f"/sys/class/hidraw/{Path(path).name}/device/report_descriptor"
             ).read_bytes()
-            print(f"report id 7 present: {b'\x85\x07' in desc}")
+            has_report7 = b"\x85\x07" in desc
+            print(f"report id 7 present: {has_report7}")
         except OSError as exc:
             print(f"descriptor unreadable here: {exc}")
         return 0
 
     if args.action == "status":
-        return do_status(path)
+        return do_status(find_device(args.device))
 
     zone_key = args.zone.lower()
     if zone_key not in ZONE_ALIASES:
@@ -246,14 +251,18 @@ def main(argv: list[str]) -> int:
     zone = ZONE_ALIASES[zone_key]
 
     if args.action in ("off", "on"):
-        return do_set(path, zone, MODES[args.action], args.dry_run)
+        mode = MODES[args.action]
+    else:
+        if not args.mode:
+            raise SystemExit("'mode' needs a mode name")
+        key = args.mode.lower()
+        if key not in MODES:
+            raise SystemExit(f"unknown mode '{args.mode}': {', '.join(sorted(MODES))}")
+        mode = MODES[key]
 
-    if not args.mode:
-        raise SystemExit("'mode' needs a mode name")
-    key = args.mode.lower()
-    if key not in MODES:
-        raise SystemExit(f"unknown mode '{args.mode}': {', '.join(sorted(MODES))}")
-    return do_set(path, zone, MODES[key], args.dry_run)
+    # A dry run only prints the frame, so it must work without the board.
+    path = None if args.dry_run else find_device(args.device)
+    return do_set(path, zone, mode, args.dry_run)
 
 
 if __name__ == "__main__":
