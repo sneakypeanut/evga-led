@@ -98,9 +98,9 @@ data `0` = dark, `1` = lit. Not yet exposed as a CLI flag.
 
 ## Firmware quirks
 
-- A **plain GET** returns the MCU's last command frame and works.
-- **After a SET, an immediate GET stalls with `EPIPE`.** The command *is* applied;
-  read-back is advisory only. Do not treat the stall as failure.
+- A **GET** returns the MCU's last command frame, including right after a SET.
+  The buffer's first byte must be the report ID (`7`): with `0`, the interface
+  (which declares only IDs 3–8) stalls the request with `EPIPE`.
 - A SET on **report ID 0 of the other interface** (`hidraw5`) can wedge the LED
   interface until a `USBDEVFS_RESET` (`0x5514`) on `/dev/bus/usb/BBB/DDD`.
 - **A USB reset restores the MCU's default lighting.** Reset only when wedged, and
