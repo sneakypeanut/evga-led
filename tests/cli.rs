@@ -71,6 +71,12 @@ fn all_commands_offer_help_without_hardware() {
         vec!["fan", "--help"],
         vec!["fan", "probe", "--help"],
         vec!["fan", "sweep", "--help"],
+        vec!["fan", "mode", "--help"],
+        vec!["fan", "manual", "--help"],
+        vec!["fan", "auto", "--help"],
+        vec!["fan", "sensor", "--help"],
+        vec!["fan", "response", "--help"],
+        vec!["fan", "save", "--help"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_evga"))
             .args(&args)
@@ -82,6 +88,86 @@ fn all_commands_offer_help_without_hardware() {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+    }
+}
+
+#[test]
+fn color_and_save_dry_runs_work_without_a_device() {
+    let color = Command::new(env!("CARGO_BIN_EXE_evga"))
+        .args([
+            "led",
+            "--device",
+            "/nonexistent-evga-test-hidraw",
+            "color",
+            "#123456",
+            "--brightness",
+            "128",
+            "-z",
+            "argb2",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        color.status.success(),
+        "{}",
+        String::from_utf8_lossy(&color.stderr)
+    );
+    let output = String::from_utf8(color.stdout).unwrap();
+    // Independent packet check against StaticOnReport's five packed ARGB slots.
+    assert!(
+        output.starts_with("zone=0x02 mode=1 checksum=0x09\n"),
+        "{output}"
+    );
+    assert!(
+        output.contains("zone=0x02 color=#123456 brightness=128 checksum=0xEC\n"),
+        "{output}"
+    );
+    assert!(output.contains("07 ea 02 03 00 00 00 ec 02 00 00 00 00 80 12 34 56 00 00 00 00 00 00 00 00 00 00 00 00 + 197 reserved bytes"), "{output}");
+
+    let save = Command::new(env!("CARGO_BIN_EXE_evga"))
+        .args([
+            "led",
+            "--device",
+            "/nonexistent-evga-test-hidraw",
+            "save",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        save.status.success(),
+        "{}",
+        String::from_utf8_lossy(&save.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(save.stdout).unwrap(),
+        "04 ea 02 12 00 00 00 00 00 00 00 00 00 00 00 00 00\n"
+    );
+}
+
+#[test]
+fn new_fan_commands_reject_invalid_requests_before_opening_ports() {
+    for (args, expected) in [
+        (vec!["mode", "8", "pwm"], "out of range"),
+        (vec!["manual", "0", "101"], "out of range"),
+        (vec!["auto", "8"], "out of range"),
+        (vec!["sensor", "8", "mb", "cpu"], "out of range"),
+        (vec!["response", "0"], "at least one"),
+        (vec!["response", "0", "--step-up", "8"], "out of range"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_evga"))
+            .arg("fan")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted {args:?}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(expected), "{args:?}: {error}");
+        assert!(
+            !error.contains("/dev/port"),
+            "opened hardware for {args:?}: {error}"
+        );
     }
 }
 

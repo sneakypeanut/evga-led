@@ -27,7 +27,7 @@ use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 /// Name used in help output and error messages.
@@ -62,10 +62,36 @@ pub const CURVE_BASE: usize = 16;
 pub const FAN_CONTROL_BASE: usize = 144;
 /// Page 0xC4 offset of `FanSpeeds` (u16 LE per fan).
 pub const FAN_SPEED_BASE: usize = 160;
+/// Page 0xC4 offset of `FanMode` (u16, 2 bits per fan).
+pub const FAN_MODE_BASE: usize = 176;
+/// Page 0xC7 offset of `FanTolerance`.
+pub const FAN_TOLERANCE_BASE: usize = 8;
+/// Page 0xC7 offset of `Fan_Step_Modes` (high nibble up, low nibble down).
+pub const FAN_STEP_BASE: usize = 144;
 /// Page 0xC7 offset of `Current_PWM`.
 pub const CURRENT_PWM_BASE: usize = 152;
 /// Page 0xC7 offset of `AdvancedMode`.
 pub const ADVANCED_MODE: usize = 216;
+/// Page 0xC4 offset of the ROM command register.
+pub const ROM_CMD: usize = 248;
+/// Page 0xC4 offset of the 3-byte little-endian ROM address.
+pub const ROM_ADDR: usize = 249;
+/// Address of the `SmartFanRom` block in EC flash (`ApplyToFlash`).
+pub const ROM_BLOCK_ADDR: u32 = 0x1E000;
+/// Bytes of page 0xD1 used by the ROM block.
+pub const ROM_LEN: usize = 176;
+
+/// `ROM_CMD.Action_Busy`/`Read_Action`; cleared by the EC when done.
+const ROM_CMD_READ: u8 = 0x80;
+/// `ROM_CMD.EraseAndWrite_Action`.
+const ROM_CMD_ERASE_WRITE: u8 = 0x81;
+/// `ROM_CMD.Function_Error`.
+const ROM_FUNCTION_ERROR: u8 = 0x7F;
+/// `SmartFanRomProtocol.AvailableReg` written by `ApplyToFlash`.
+const ROM_AVAILABLE: u8 = 170;
+
+/// Bit 7 of a `FanControl` byte: manual duty instead of the EC curve.
+const FAN_CONTROL_MANUAL: u8 = 0x80;
 
 /// RPM above this counts as spinning.
 pub const MIN_SPIN_RPM: u16 = 200;
@@ -630,6 +656,47 @@ fn write_backup(dir: &Path, prefix: &str, state: &EcState) -> io::Result<PathBuf
 /// Default restore source: the `backup-*.json` with the highest
 /// `(stamp, collision-suffix)`, which is the order the tool writes them in.
 /// mtime is not used, so copying or touching an old backup cannot make it win.
+/// Write the pre-save flash image next to the JSON backup.
+///
+/// `ApplyToFlash` erases the 176-byte block, so the bytes it is about to
+/// destroy must be recoverable even if the write fails part-way.
+fn write_rom_backup(dir: &Path, prefix: &str, rom: &[u8; ROM_LEN]) -> io::Result<PathBuf> {
+    use std::io::Write;
+
+    fs::create_dir_all(dir)?;
+    let stamp = local_timestamp();
+    let mut n = 0u32;
+    loop {
+        let name = if n == 0 {
+            format!("{prefix}-{stamp}-rom.bin")
+        } else {
+            format!("{prefix}-{stamp}-rom-{n}.bin")
+        };
+        let path = dir.join(name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(rom)?;
+                file.sync_all()?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                n += 1;
+                if n > 10_000 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("{}: too many ROM backups with stamp {stamp}", dir.display()),
+                    ));
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn latest_backup(dir: &Path) -> io::Result<PathBuf> {
     let mut best: Option<((String, u32), PathBuf)> = None;
     let entries = fs::read_dir(dir).map_err(|err| {
@@ -719,8 +786,247 @@ fn restore_pages<B: EcBus>(ec: &mut Ec<B>, state: &EcState) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-fan settings
+// ---------------------------------------------------------------------------
+
+/// Write one fan's 2-bit `FanMode`, preserving the other fans.
+fn set_fan_mode<B: EcBus>(ec: &mut Ec<B>, fan: usize, mode: u8) -> io::Result<()> {
+    let lo = ec.read(PAGE_ACPI, FAN_MODE_BASE as u8)?;
+    let hi = ec.read(PAGE_ACPI, (FAN_MODE_BASE + 1) as u8)?;
+    let word = u16::from(lo) | (u16::from(hi) << 8);
+    let shift = fan * 2;
+    let next = (word & !(3u16 << shift)) | (u16::from(mode & 3) << shift);
+    ec.write(PAGE_ACPI, FAN_MODE_BASE as u8, (next & 0xFF) as u8)?;
+    ec.write(PAGE_ACPI, (FAN_MODE_BASE + 1) as u8, (next >> 8) as u8)
+}
+
+/// Set or clear the manual bit of a `FanControl` byte, preserving the sensor
+/// selection in bits 0..6.
+fn set_manual<B: EcBus>(ec: &mut Ec<B>, fan: usize, manual: bool) -> io::Result<()> {
+    let reg = FAN_CONTROL_BASE + fan * 2;
+    let mut control = ec.read(PAGE_ACPI, reg as u8)?;
+    if manual {
+        control |= FAN_CONTROL_MANUAL;
+    } else {
+        control &= !FAN_CONTROL_MANUAL;
+    }
+    ec.write(PAGE_ACPI, reg as u8, control)
+}
+
+/// Write the manual duty for a fan (byte after its `FanControl` byte).
+fn set_pwm<B: EcBus>(ec: &mut Ec<B>, fan: usize, pwm: u8) -> io::Result<()> {
+    ec.write(PAGE_ACPI, (FAN_CONTROL_BASE + fan * 2 + 1) as u8, pwm)
+}
+
+/// Select the sensor source and input, preserving the manual bit.
+fn set_sensor<B: EcBus>(ec: &mut Ec<B>, fan: usize, source: u8, sensor: u8) -> io::Result<()> {
+    let reg = FAN_CONTROL_BASE + fan * 2;
+    let control = ec.read(PAGE_ACPI, reg as u8)?;
+    let value = (control & FAN_CONTROL_MANUAL) | (source & 0x70) | (sensor & 0x0F);
+    ec.write(PAGE_ACPI, reg as u8, value)
+}
+
+/// Update `FanTolerance` and the high/low nibbles of `Fan_Step_Modes`.
+fn set_response<B: EcBus>(
+    ec: &mut Ec<B>,
+    fan: usize,
+    tolerance: Option<u8>,
+    step_up: Option<u8>,
+    step_down: Option<u8>,
+) -> io::Result<()> {
+    if let Some(value) = tolerance {
+        ec.write(PAGE_FAN, (FAN_TOLERANCE_BASE + fan) as u8, value)?;
+    }
+    if step_up.is_none() && step_down.is_none() {
+        return Ok(());
+    }
+    let reg = FAN_STEP_BASE + fan;
+    let mut value = ec.read(PAGE_FAN, reg as u8)?;
+    if let Some(up) = step_up {
+        value = (value & !0x70) | ((up & 0x07) << 4);
+    }
+    if let Some(down) = step_down {
+        value = (value & !0x07) | (down & 0x07);
+    }
+    ec.write(PAGE_FAN, reg as u8, value)
+}
+
+/// Build the 176-byte `SmartFanRomProtocol` image ELeet X1 writes with
+/// `ApplyToFlash`, including its one-byte two's-complement checksum.
+///
+/// The vendor mutates the `SmartFanRomProtocol` it just read from flash, so
+/// reserved bytes must survive: start from `current` and overlay only the
+/// documented fields.
+fn build_rom_image(current: &[u8; ROM_LEN], acpi: &[u8], smartfan: &[u8]) -> [u8; ROM_LEN] {
+    let mut rom = *current;
+    rom[0] = ROM_AVAILABLE;
+    // The checksum byte is excluded from the sum by zeroing it first.
+    rom[1] = 0;
+    rom[2..4].copy_from_slice(&acpi[FAN_MODE_BASE..FAN_MODE_BASE + 2]);
+    rom[4] = smartfan[ADVANCED_MODE];
+    rom[8..16].copy_from_slice(&smartfan[FAN_TOLERANCE_BASE..FAN_TOLERANCE_BASE + FAN_COUNT]);
+    rom[16..16 + FAN_COUNT * CURVE_LEN]
+        .copy_from_slice(&smartfan[CURVE_BASE..CURVE_BASE + FAN_COUNT * CURVE_LEN]);
+    rom[144..152].copy_from_slice(&smartfan[FAN_STEP_BASE..FAN_STEP_BASE + FAN_COUNT]);
+    rom[160..176].copy_from_slice(&acpi[FAN_CONTROL_BASE..FAN_CONTROL_BASE + FAN_COUNT * 2]);
+    let sum = rom.iter().fold(0u8, |acc, &byte| acc.wrapping_add(byte));
+    rom[1] = sum.wrapping_neg();
+    rom
+}
+
+/// Read the 176-byte `SmartFanRom` block currently stored in EC flash.
+fn read_rom<B: EcBus>(ec: &mut Ec<B>) -> io::Result<[u8; ROM_LEN]> {
+    rom_command(ec, ROM_BLOCK_ADDR, ROM_CMD_READ)?;
+    let bytes = read_block(ec, PAGE_FAN_ROM, 0, ROM_LEN)?;
+    let mut rom = [0u8; ROM_LEN];
+    rom.copy_from_slice(&bytes);
+    Ok(rom)
+}
+
+/// Issue a ROM command and wait for the EC to clear the busy bit.
+fn rom_command<B: EcBus>(ec: &mut Ec<B>, addr: u32, command: u8) -> io::Result<()> {
+    for i in 0..3 {
+        ec.write(
+            PAGE_ACPI,
+            (ROM_ADDR + i) as u8,
+            ((addr >> (8 * i)) & 0xFF) as u8,
+        )?;
+    }
+    ec.write(PAGE_ACPI, ROM_CMD as u8, command)?;
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(10));
+        let status = ec.read(PAGE_ACPI, ROM_CMD as u8)?;
+        if status & 0x80 == 0 {
+            if status == ROM_FUNCTION_ERROR {
+                return Err(io::Error::other("EC ROM command reported Function_Error"));
+            }
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "EC ROM command stayed busy",
+    ))
+}
+
+/// ELeet X1's `ApplyToFlash`: only writes when the live settings differ from
+/// what is already in `current`, then verifies by reading the block back.
+fn apply_to_flash<B: EcBus>(ec: &mut Ec<B>, current: &[u8; ROM_LEN]) -> io::Result<bool> {
+    let acpi = read_block(ec, PAGE_ACPI, 0, PAGE_LEN)?;
+    let smartfan = read_block(ec, PAGE_FAN, 0, PAGE_LEN)?;
+    let desired = build_rom_image(current, &acpi, &smartfan);
+    if current == &desired {
+        return Ok(false);
+    }
+    for (reg, &value) in desired.iter().enumerate() {
+        ec.write(PAGE_FAN_ROM, reg as u8, value)?;
+    }
+    rom_command(ec, ROM_BLOCK_ADDR, ROM_CMD_ERASE_WRITE)?;
+    let readback = read_rom(ec)?;
+    if readback != desired {
+        return Err(io::Error::other(
+            "EC flash read-back does not match the settings that were written",
+        ));
+    }
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
+
+/// `FanMode`: how the EC drives the header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HeaderMode {
+    /// Firmware auto (`AutoByIC`)
+    Auto,
+    /// DC voltage control
+    Dc,
+    /// PWM control
+    Pwm,
+}
+
+impl HeaderMode {
+    fn value(self) -> u8 {
+        match self {
+            HeaderMode::Auto => 0,
+            HeaderMode::Dc => 1,
+            HeaderMode::Pwm => 2,
+        }
+    }
+}
+
+/// `SensorSource`: motherboard or a VGA sensor forwarded by the EC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SensorSourceArg {
+    Mb,
+    Vga1,
+    Vga2,
+    Vga3,
+    Vga4,
+    Vga5,
+    Vga6,
+    Vga7,
+}
+
+impl SensorSourceArg {
+    fn value(self) -> u8 {
+        match self {
+            SensorSourceArg::Mb => 0,
+            SensorSourceArg::Vga1 => 16,
+            SensorSourceArg::Vga2 => 32,
+            SensorSourceArg::Vga3 => 48,
+            SensorSourceArg::Vga4 => 64,
+            SensorSourceArg::Vga5 => 80,
+            SensorSourceArg::Vga6 => 96,
+            SensorSourceArg::Vga7 => 112,
+        }
+    }
+}
+
+/// `Sensor`: which temperature drives the fan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SensorArg {
+    Cpu,
+    Pwm,
+    Sys,
+    Temp4,
+    Temp5,
+    Temp6,
+    Temp7,
+    Temp8,
+    Temp9,
+    Temp10,
+    Temp11,
+    Temp12,
+    Temp13,
+    Temp14,
+    Temp15,
+    Temp16,
+}
+
+impl SensorArg {
+    fn value(self) -> u8 {
+        match self {
+            SensorArg::Cpu => 0,
+            SensorArg::Pwm => 1,
+            SensorArg::Sys => 2,
+            SensorArg::Temp4 => 3,
+            SensorArg::Temp5 => 4,
+            SensorArg::Temp6 => 5,
+            SensorArg::Temp7 => 6,
+            SensorArg::Temp8 => 7,
+            SensorArg::Temp9 => 8,
+            SensorArg::Temp10 => 9,
+            SensorArg::Temp11 => 10,
+            SensorArg::Temp12 => 11,
+            SensorArg::Temp13 => 12,
+            SensorArg::Temp14 => 13,
+            SensorArg::Temp15 => 14,
+            SensorArg::Temp16 => 15,
+        }
+    }
+}
 
 #[derive(Debug, Args)]
 #[command(
@@ -770,6 +1076,52 @@ pub enum Action {
         #[arg(default_value_t = 7)]
         fan: i64,
     },
+    /// Set a header mode: auto, DC or PWM
+    Mode {
+        /// Fan index, 0..=7
+        fan: i64,
+        #[arg(value_enum)]
+        mode: HeaderMode,
+    },
+    /// Drive a fan at a fixed manual duty
+    Manual {
+        /// Fan index, 0..=7
+        fan: i64,
+        /// Duty percent, 0..=100
+        pwm: u8,
+    },
+    /// Return a fan to firmware (curve) control
+    Auto {
+        /// Fan index, 0..=7
+        fan: i64,
+    },
+    /// Choose the temperature sensor that drives a fan
+    Sensor {
+        /// Fan index, 0..=7
+        fan: i64,
+        /// Motherboard sensor or a forwarded VGA sensor
+        #[arg(value_enum)]
+        source: SensorSourceArg,
+        /// Temperature input, default cpu
+        #[arg(value_enum, default_value_t = SensorArg::Cpu)]
+        sensor: SensorArg,
+    },
+    /// Set fan hysteresis and ramp step response
+    Response {
+        /// Fan index, 0..=7
+        fan: i64,
+        /// Temperature hysteresis in C
+        #[arg(long)]
+        tolerance: Option<u8>,
+        /// Step-up rate, 0..=7
+        #[arg(long)]
+        step_up: Option<u8>,
+        /// Step-down rate, 0..=7
+        #[arg(long)]
+        step_down: Option<u8>,
+    },
+    /// Persist the current fan settings to EC flash
+    Save,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -777,8 +1129,37 @@ enum Plan {
     Show,
     Backup,
     Quiet,
-    Curve { fan: usize, curve: Curve },
-    Restore { path: PathBuf, state: EcState },
+    Curve {
+        fan: usize,
+        curve: Curve,
+    },
+    Restore {
+        path: PathBuf,
+        state: EcState,
+    },
+    Mode {
+        fan: usize,
+        mode: u8,
+    },
+    Manual {
+        fan: usize,
+        pwm: u8,
+    },
+    Auto {
+        fan: usize,
+    },
+    Sensor {
+        fan: usize,
+        source: u8,
+        sensor: u8,
+    },
+    Response {
+        fan: usize,
+        tolerance: Option<u8>,
+        step_up: Option<u8>,
+        step_down: Option<u8>,
+    },
+    Save,
 }
 
 /// Validate and resolve everything that does not need hardware, so a bad
@@ -805,6 +1186,52 @@ fn plan_action(args: &Cli, dir: &Path) -> std::result::Result<Plan, FanError> {
             require_evga_ec(&state).map_err(FanError::from)?;
             Plan::Restore { path, state }
         }
+        Action::Mode { fan, mode } => Plan::Mode {
+            fan: validate_fan_index(*fan)?,
+            mode: mode.value(),
+        },
+        Action::Manual { fan, pwm } => {
+            let fan = validate_fan_index(*fan)?;
+            if *pwm > 100 {
+                return Err(FanError::new(format!(
+                    "duty {pwm}% out of range: {TOOL} manual accepts 0..=100"
+                )));
+            }
+            Plan::Manual { fan, pwm: *pwm }
+        }
+        Action::Auto { fan } => Plan::Auto {
+            fan: validate_fan_index(*fan)?,
+        },
+        Action::Sensor {
+            fan,
+            source,
+            sensor,
+        } => Plan::Sensor {
+            fan: validate_fan_index(*fan)?,
+            source: source.value(),
+            sensor: sensor.value(),
+        },
+        Action::Response {
+            fan,
+            tolerance,
+            step_up,
+            step_down,
+        } => {
+            if tolerance.is_none() && step_up.is_none() && step_down.is_none() {
+                return Err(FanError::new(
+                    "response needs at least one of --tolerance, --step-up, --step-down",
+                ));
+            }
+            Plan::Response {
+                fan: validate_fan_index(*fan)?,
+                tolerance: *tolerance,
+                step_up: step_up.map(|v| validate_step(v, "--step-up")).transpose()?,
+                step_down: step_down
+                    .map(|v| validate_step(v, "--step-down"))
+                    .transpose()?,
+            }
+        }
+        Action::Save => Plan::Save,
         // Handled by `run` before planning; neither goes through a Plan.
         Action::Probe { .. } | Action::Sweep { .. } => {
             return Err(FanError::new(
@@ -812,6 +1239,16 @@ fn plan_action(args: &Cli, dir: &Path) -> std::result::Result<Plan, FanError> {
             ));
         }
     })
+}
+
+/// `Fan_Step_Modes` stores three bits per direction.
+fn validate_step(value: u8, flag: &str) -> std::result::Result<u8, FanError> {
+    if value > 7 {
+        return Err(FanError::new(format!(
+            "{flag} {value} out of range: step modes are 0..=7"
+        )));
+    }
+    Ok(value)
 }
 
 impl From<io::Error> for FanError {
@@ -881,8 +1318,111 @@ fn execute<B: EcBus>(plan: Plan, ec: &mut Ec<B>, dir: &Path) -> Result<(), Box<d
             restore_pages(ec, &state)?;
             println!("restored both pages from {}", path.display());
         }
+        Plan::Mode { fan, mode } => {
+            backup_before_write(ec, dir)?;
+            set_fan_mode(ec, fan, mode)?;
+            println!("fan {fan}: header mode -> {}", header_mode_name(mode));
+        }
+        Plan::Manual { fan, pwm } => {
+            backup_before_write(ec, dir)?;
+            // Set the duty before taking manual control: if this write fails,
+            // the fan must stay under firmware/curve control rather than being
+            // forced to a stale manual duty.
+            set_pwm(ec, fan, pwm)?;
+            set_manual(ec, fan, true)?;
+            if pwm != 0 && pwm < STALL_FLOOR_PCT {
+                println!(
+                    "warning: {pwm}% is below the measured {STALL_FLOOR_PCT}% stall floor; \
+                     the fan may stop"
+                );
+            }
+            println!("fan {fan}: manual -> {pwm}%");
+        }
+        Plan::Auto { fan } => {
+            backup_before_write(ec, dir)?;
+            set_manual(ec, fan, false)?;
+            println!("fan {fan}: firmware control (manual bit cleared)");
+        }
+        Plan::Sensor {
+            fan,
+            source,
+            sensor,
+        } => {
+            backup_before_write(ec, dir)?;
+            set_sensor(ec, fan, source, sensor)?;
+            println!(
+                "fan {fan}: sensor -> source {} index {sensor}",
+                sensor_source_name(source)
+            );
+        }
+        Plan::Response {
+            fan,
+            tolerance,
+            step_up,
+            step_down,
+        } => {
+            backup_before_write(ec, dir)?;
+            set_response(ec, fan, tolerance, step_up, step_down)?;
+            let mut parts = Vec::new();
+            if let Some(value) = tolerance {
+                parts.push(format!("tolerance {value}C"));
+            }
+            if let Some(value) = step_up {
+                parts.push(format!("step-up {value}"));
+            }
+            if let Some(value) = step_down {
+                parts.push(format!("step-down {value}"));
+            }
+            println!("fan {fan}: {}", parts.join(", "));
+        }
+        Plan::Save => {
+            let state = read_all(ec)?;
+            require_evga_ec(&state)?;
+            // Read the old flash block, then persist both backups before any
+            // ERASE_WRITE can destroy it.
+            let rom = read_rom(ec)?;
+            let path = write_backup(dir, "pre-save", &state)?;
+            let rom_path = write_rom_backup(dir, "pre-save", &rom)?;
+            println!("backup: {} (flash {})", path.display(), rom_path.display());
+            if apply_to_flash(ec, &rom)? {
+                println!("fan settings saved to EC flash at 0x{ROM_BLOCK_ADDR:05X}");
+            } else {
+                println!("EC flash already matches the live settings; nothing written");
+            }
+        }
     }
     Ok(())
+}
+
+fn backup_before_write<B: EcBus>(ec: &mut Ec<B>, dir: &Path) -> io::Result<()> {
+    let state = read_all(ec)?;
+    require_evga_ec(&state)?;
+    let path = write_backup(dir, "pre-set", &state)?;
+    println!("backup: {}", path.display());
+    Ok(())
+}
+
+fn header_mode_name(mode: u8) -> &'static str {
+    match mode {
+        0 => "auto",
+        1 => "dc",
+        2 => "pwm",
+        _ => "unknown",
+    }
+}
+
+fn sensor_source_name(source: u8) -> String {
+    match source {
+        0 => "mb".to_string(),
+        16 => "vga1".to_string(),
+        32 => "vga2".to_string(),
+        48 => "vga3".to_string(),
+        64 => "vga4".to_string(),
+        80 => "vga5".to_string(),
+        96 => "vga6".to_string(),
+        112 => "vga7".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Delays used between EC writes and reads. Tests use zeros.
@@ -957,18 +1497,30 @@ fn probe<B: EcBus>(ec: &mut Ec<B>) -> io::Result<()> {
     println!("\n--- per-fan state (page 0x{PAGE_ACPI:02X}) ---");
     let speeds = read_block(ec, PAGE_ACPI, FAN_SPEED_BASE, FAN_COUNT * 2)?;
     let pwmcfg = read_block(ec, PAGE_ACPI, FAN_CONTROL_BASE, FAN_COUNT * 2)?;
-    println!("{:>3} {:>8} {:>5} {:>6}", "fan", "control", "PWM", "RPM");
+    println!(
+        "{:>3} {:>8} {:>5} {:>6}  control",
+        "fan", "control", "PWM", "RPM"
+    );
     for fan in 0..FAN_COUNT {
         let rpm = u16::from(speeds[fan * 2]) | (u16::from(speeds[fan * 2 + 1]) << 8);
         let control = pwmcfg[fan * 2];
         let pwm = pwmcfg[fan * 2 + 1];
-        println!("{fan:>3} {control:>8} {pwm:>5} {rpm:>6}");
+        let manual = if control & FAN_CONTROL_MANUAL != 0 {
+            "manual"
+        } else {
+            "curve"
+        };
+        println!(
+            "{fan:>3} {control:>8} {pwm:>5} {rpm:>6}  {manual}/{}",
+            sensor_source_name(control & 0x70)
+        );
     }
-    let fanmode = read_block(ec, PAGE_ACPI, 176, 2)?;
-    println!(
-        "FanMode = {}",
-        u16::from(fanmode[0]) | (u16::from(fanmode[1]) << 8)
-    );
+    let fanmode = read_block(ec, PAGE_ACPI, FAN_MODE_BASE, 2)?;
+    let mode_word = u16::from(fanmode[0]) | (u16::from(fanmode[1]) << 8);
+    let modes: Vec<&str> = (0..FAN_COUNT)
+        .map(|fan| header_mode_name(((mode_word >> (fan * 2)) & 3) as u8))
+        .collect();
+    println!("FanMode = 0x{mode_word:04X} [{}]", modes.join(", "));
 
     println!("\n--- curves (page 0x{PAGE_FAN:02X}) ---");
     let adv = ec.read(PAGE_FAN, ADVANCED_MODE as u8)?;
@@ -1196,11 +1748,23 @@ mod tests {
         /// Degrees the modelled EC adds to a written low point when it reports
         /// `Current_PWM`, standing in for a warmer sensor.
         pwm_bias: u8,
+        /// Contents of the simulated EC flash block at 0x1E000.
+        rom: Option<[u8; ROM_LEN]>,
+        /// Report `Function_Error` for every ROM command.
+        rom_error: bool,
+        /// Leave the ROM command busy forever, forcing a timeout.
+        rom_stuck_busy: bool,
+        /// Corrupt one byte when an erase/write commits, to model a bad read-back.
+        rom_corrupt_write: bool,
     }
 
     impl MockEc {
         fn seed(&mut self, page: u8, reg: usize, value: u8) {
             self.pages.entry(page).or_insert([0u8; PAGE_LEN])[reg] = value;
+        }
+
+        fn seed_rom(&mut self, rom: [u8; ROM_LEN]) {
+            self.rom = Some(rom);
         }
 
         fn page(&self, page: u8) -> [u8; PAGE_LEN] {
@@ -1267,6 +1831,51 @@ mod tests {
                                 .entry(self.selected_page)
                                 .or_insert([0u8; PAGE_LEN])
                                 [self.selected_reg as usize] = value;
+                            // Model the EC's ROM command handshake: a read loads
+                            // the simulated flash block into page 0xD1, an
+                            // erase/write copies page 0xD1 into flash.
+                            if self.selected_page == PAGE_ACPI
+                                && self.selected_reg as usize == ROM_CMD
+                            {
+                                if self.rom_stuck_busy {
+                                    // Leave the busy bit set; the controller
+                                    // must give up after its poll budget.
+                                    return Ok(());
+                                }
+                                if self.rom_error {
+                                    self.pages.entry(PAGE_ACPI).or_insert([0u8; PAGE_LEN])
+                                        [ROM_CMD] = ROM_FUNCTION_ERROR;
+                                    return Ok(());
+                                }
+                                match value {
+                                    ROM_CMD_READ => {
+                                        if let Some(rom) = self.rom {
+                                            let page = self
+                                                .pages
+                                                .entry(PAGE_FAN_ROM)
+                                                .or_insert([0u8; PAGE_LEN]);
+                                            page[..ROM_LEN].copy_from_slice(&rom);
+                                        }
+                                        self.pages.entry(PAGE_ACPI).or_insert([0u8; PAGE_LEN])
+                                            [ROM_CMD] = 0;
+                                    }
+                                    ROM_CMD_ERASE_WRITE => {
+                                        let page = self
+                                            .pages
+                                            .entry(PAGE_FAN_ROM)
+                                            .or_insert([0u8; PAGE_LEN]);
+                                        let mut rom = [0u8; ROM_LEN];
+                                        rom.copy_from_slice(&page[..ROM_LEN]);
+                                        if self.rom_corrupt_write {
+                                            rom[5] ^= 0xFF;
+                                        }
+                                        self.rom = Some(rom);
+                                        self.pages.entry(PAGE_ACPI).or_insert([0u8; PAGE_LEN])
+                                            [ROM_CMD] = 1;
+                                    }
+                                    _ => {}
+                                }
+                            }
                             // The EC reflects the low curve point in Current_PWM;
                             // `pwm_bias` models a warmer sensor asking for more.
                             if self.selected_page == PAGE_FAN {
@@ -2081,5 +2690,314 @@ mod tests {
         assert_eq!(pre.len(), 1, "one pre-restore backup, got {pre:?}");
         let saved: EcState = serde_json::from_slice(&fs::read(&pre[0]).unwrap()).unwrap();
         assert_eq!(saved.acpi[200], 0xAB, "backup holds the pre-restore page");
+    }
+
+    #[test]
+    fn set_fan_mode_rewrites_only_its_two_bits() {
+        let mut mock = seeded_mock();
+        // Every fan starts as PWM (0b10), i.e. 0xAAAA.
+        mock.seed(PAGE_ACPI, FAN_MODE_BASE, 0xAA);
+        mock.seed(PAGE_ACPI, FAN_MODE_BASE + 1, 0xAA);
+        let mut ec = Ec::new(mock);
+
+        set_fan_mode(&mut ec, 3, HeaderMode::Dc.value()).expect("set mode");
+        let low = ec.read(PAGE_ACPI, FAN_MODE_BASE as u8).unwrap();
+        let high = ec.read(PAGE_ACPI, (FAN_MODE_BASE + 1) as u8).unwrap();
+        let word = u16::from(low) | (u16::from(high) << 8);
+
+        for fan in 0..FAN_COUNT {
+            let bits = (word >> (fan * 2)) & 3;
+            let expected = if fan == 3 { 1 } else { 2 };
+            assert_eq!(bits, expected, "fan {fan} mode bits");
+        }
+    }
+
+    #[test]
+    fn manual_and_auto_toggle_bit_seven_and_keep_sensor_bits() {
+        let mut mock = seeded_mock();
+        // Sensor source VGA2 (0x20), index 5.
+        mock.seed(PAGE_ACPI, FAN_CONTROL_BASE + 4, 0x25);
+        let mut ec = Ec::new(mock);
+
+        set_manual(&mut ec, 2, true).expect("manual on");
+        assert_eq!(
+            ec.read(PAGE_ACPI, (FAN_CONTROL_BASE + 4) as u8).unwrap(),
+            0xA5
+        );
+        set_pwm(&mut ec, 2, 70).expect("pwm");
+        assert_eq!(
+            ec.read(PAGE_ACPI, (FAN_CONTROL_BASE + 5) as u8).unwrap(),
+            70
+        );
+
+        set_manual(&mut ec, 2, false).expect("manual off");
+        assert_eq!(
+            ec.read(PAGE_ACPI, (FAN_CONTROL_BASE + 4) as u8).unwrap(),
+            0x25
+        );
+    }
+
+    #[test]
+    fn set_sensor_keeps_the_manual_bit_and_sets_source_and_index() {
+        let mut mock = seeded_mock();
+        // Manual, source MB, index CPU.
+        mock.seed(PAGE_ACPI, FAN_CONTROL_BASE, 0x80);
+        let mut ec = Ec::new(mock);
+
+        set_sensor(
+            &mut ec,
+            0,
+            SensorSourceArg::Vga7.value(),
+            SensorArg::Temp16.value(),
+        )
+        .expect("set sensor");
+        let control = ec.read(PAGE_ACPI, FAN_CONTROL_BASE as u8).unwrap();
+        assert_eq!(control, 0x80 | 0x70 | 0x0F);
+    }
+
+    #[test]
+    fn set_response_writes_tolerance_and_splits_step_nibbles() {
+        let mut mock = seeded_mock();
+        mock.seed(PAGE_FAN, FAN_STEP_BASE + 6, 0b0011_0100);
+        let mut ec = Ec::new(mock);
+
+        set_response(&mut ec, 6, Some(7), Some(5), None).expect("set response");
+        assert_eq!(
+            ec.read(PAGE_FAN, (FAN_TOLERANCE_BASE + 6) as u8).unwrap(),
+            7
+        );
+        assert_eq!(
+            ec.read(PAGE_FAN, (FAN_STEP_BASE + 6) as u8).unwrap(),
+            0b0101_0100,
+            "only the step-up nibble changes"
+        );
+
+        set_response(&mut ec, 6, None, None, Some(2)).expect("set down");
+        assert_eq!(
+            ec.read(PAGE_FAN, (FAN_STEP_BASE + 6) as u8).unwrap(),
+            0b0101_0010
+        );
+    }
+
+    #[test]
+    fn rom_image_has_the_vendor_layout_and_preserves_reserved_bytes() {
+        let mut mock = seeded_mock();
+        mock.seed(PAGE_ACPI, FAN_MODE_BASE, 0x88);
+        mock.seed(PAGE_ACPI, FAN_MODE_BASE + 1, 0x01);
+        mock.seed(PAGE_FAN, ADVANCED_MODE, 0b1010_0101);
+        mock.seed(PAGE_FAN, FAN_TOLERANCE_BASE + 3, 9);
+        mock.seed(PAGE_FAN, FAN_STEP_BASE + 2, 0x42);
+        mock.seed(PAGE_ACPI, FAN_CONTROL_BASE + 10, 0x80);
+        mock.seed(PAGE_ACPI, FAN_CONTROL_BASE + 11, 64);
+        let mut ec = Ec::new(mock);
+        let acpi = read_block(&mut ec, PAGE_ACPI, 0, PAGE_LEN).unwrap();
+        let fan = read_block(&mut ec, PAGE_FAN, 0, PAGE_LEN).unwrap();
+
+        // Bytes outside the documented fields come from the existing block.
+        let mut current = [0u8; ROM_LEN];
+        current[0] = 0x11;
+        current[1] = 0x22;
+        current[5..8].copy_from_slice(&[0x31, 0x32, 0x33]);
+        current[152..160].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let rom = build_rom_image(&current, &acpi, &fan);
+        assert_eq!(rom[0], 0xAA);
+        assert_eq!(&rom[2..4], &[0x88, 0x01], "FanMode little-endian");
+        assert_eq!(rom[4], 0b1010_0101, "AdvancedMode");
+        assert_eq!(&rom[5..8], &[0x31, 0x32, 0x33], "reserved 5..8 kept");
+        assert_eq!(rom[8 + 3], 9, "FanTolerance");
+        assert_eq!(&rom[16..32], &fan[CURVE_BASE..CURVE_BASE + CURVE_LEN]);
+        assert_eq!(rom[144 + 2], 0x42, "Fan_Step_Modes");
+        assert_eq!(
+            &rom[152..160],
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            "reserved 152..160 kept"
+        );
+        assert_eq!(
+            &rom[160..176],
+            &acpi[FAN_CONTROL_BASE..FAN_CONTROL_BASE + 16]
+        );
+        let sum = rom.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+        assert_eq!(
+            sum, 0,
+            "two's-complement checksum makes the image sum to zero"
+        );
+    }
+
+    #[test]
+    fn apply_to_flash_preserves_reserved_bytes_and_skips_an_identical_image() {
+        let mut mock = seeded_mock();
+        mock.seed(PAGE_ACPI, FAN_MODE_BASE, 0x02);
+        let mut initial = [0xFFu8; ROM_LEN];
+        initial[5] = 0x5A;
+        initial[152] = 0xA5;
+        mock.seed_rom(initial);
+        let mut ec = Ec::new(mock);
+
+        let current = read_rom(&mut ec).expect("read old block");
+        assert!(
+            apply_to_flash(&mut ec, &current).expect("first save"),
+            "first save writes over the stale block"
+        );
+        let acpi = read_block(&mut ec, PAGE_ACPI, 0, PAGE_LEN).unwrap();
+        let fan = read_block(&mut ec, PAGE_FAN, 0, PAGE_LEN).unwrap();
+        let expected = build_rom_image(&current, &acpi, &fan);
+        assert_eq!(ec.bus.rom, Some(expected), "flash holds the new image");
+        let written = ec.bus.rom.unwrap();
+        assert_eq!(&written[5..8], &[0x5A, 0xFF, 0xFF], "reserved bytes kept");
+        assert_eq!(written[152], 0xA5, "reserved byte 152 kept");
+
+        assert!(
+            !apply_to_flash(&mut ec, &written).expect("second save"),
+            "second save skips an identical image"
+        );
+    }
+
+    #[test]
+    fn rom_function_error_is_reported() {
+        let mut mock = seeded_mock();
+        mock.rom_error = true;
+        let mut ec = Ec::new(mock);
+        let err = read_rom(&mut ec).expect_err("Function_Error must fail");
+        assert!(err.to_string().contains("Function_Error"), "got {err}");
+    }
+
+    #[test]
+    fn rom_busy_timeout_is_reported() {
+        let mut mock = seeded_mock();
+        mock.rom_stuck_busy = true;
+        let mut ec = Ec::new(mock);
+        let err = read_rom(&mut ec).expect_err("a stuck busy bit must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "got {err}");
+    }
+
+    #[test]
+    fn apply_to_flash_rejects_a_mismatched_readback() {
+        let mut mock = seeded_mock();
+        mock.rom_corrupt_write = true;
+        let mut ec = Ec::new(mock);
+        let current = read_rom(&mut ec).expect("read old block");
+        let err = apply_to_flash(&mut ec, &current).expect_err("corrupt write must fail");
+        assert!(err.to_string().contains("read-back"), "got {err}");
+    }
+
+    #[test]
+    fn new_commands_validate_arguments_before_opening_hardware() {
+        let dir = TempDir::new("fan-new-validation");
+
+        let manual = Cli {
+            action: Action::Manual { fan: 0, pwm: 101 },
+        };
+        assert!(plan_action(&manual, dir.path()).is_err(), "duty > 100");
+
+        let response = Cli {
+            action: Action::Response {
+                fan: 0,
+                tolerance: None,
+                step_up: None,
+                step_down: None,
+            },
+        };
+        assert!(
+            plan_action(&response, dir.path()).is_err(),
+            "no response fields"
+        );
+
+        let step = Cli {
+            action: Action::Response {
+                fan: 0,
+                tolerance: None,
+                step_up: Some(8),
+                step_down: None,
+            },
+        };
+        assert!(plan_action(&step, dir.path()).is_err(), "step > 7");
+
+        let fan = Cli {
+            action: Action::Mode {
+                fan: 8,
+                mode: HeaderMode::Pwm,
+            },
+        };
+        assert!(plan_action(&fan, dir.path()).is_err(), "fan index > 7");
+    }
+
+    #[test]
+    fn manual_enables_the_manual_bit_only_after_the_duty_write_succeeds() {
+        let dir = TempDir::new("fan-manual-fault");
+        let mut mock = seeded_mock();
+        mock.seed(PAGE_ACPI, FAN_CONTROL_BASE + 4, 0x25);
+        mock.seed(PAGE_ACPI, FAN_CONTROL_BASE + 5, 50);
+        // The first data write is the duty; fail it before manual is enabled.
+        mock.fail_once_at = Some(0);
+        let mut ec = Ec::new(mock);
+
+        let err = execute(Plan::Manual { fan: 2, pwm: 70 }, &mut ec, dir.path())
+            .expect_err("injected duty fault must fail");
+        assert!(
+            err.to_string().contains("injected EC write fault"),
+            "got {err}"
+        );
+
+        let control = ec.read(PAGE_ACPI, (FAN_CONTROL_BASE + 4) as u8).unwrap();
+        assert_eq!(
+            control & FAN_CONTROL_MANUAL,
+            0,
+            "manual bit must stay clear"
+        );
+        let pwm = ec.read(PAGE_ACPI, (FAN_CONTROL_BASE + 5) as u8).unwrap();
+        assert_eq!(pwm, 50, "duty keeps its old value");
+    }
+
+    #[test]
+    fn save_command_backs_up_ram_and_flash_before_writing() {
+        let dir = TempDir::new("fan-save");
+        let mut mock = seeded_mock();
+        let mut old = [0u8; ROM_LEN];
+        old[5] = 0x5A;
+        old[16] = 0x77;
+        mock.seed_rom(old);
+        let mut ec = Ec::new(mock);
+        execute(Plan::Save, &mut ec, dir.path()).expect("save");
+
+        let mut json = None;
+        let mut bin = None;
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if name.starts_with("pre-save-") && name.ends_with(".json") {
+                json = Some(path);
+            } else if name.starts_with("pre-save-") && name.ends_with("-rom.bin") {
+                bin = Some(path);
+            }
+        }
+        let json = json.expect("pre-save JSON backup");
+        let bin = bin.expect("pre-save ROM backup");
+        let saved: EcState = serde_json::from_slice(&fs::read(&json).unwrap()).unwrap();
+        assert_eq!(saved.advanced, 0, "backup predates the flash write");
+        assert_eq!(&fs::read(&bin).unwrap(), &old, "old flash bytes preserved");
+        assert!(ec.bus.rom.is_some(), "flash block written");
+    }
+
+    #[test]
+    fn save_leaves_flash_untouched_when_the_backup_fails() {
+        let parent = TempDir::new("fan-save-fail");
+        // A regular file where the state directory should be makes every
+        // backup write fail before ApplyToFlash can run.
+        let blocked = parent.path().join("blocked");
+        fs::write(&blocked, b"").unwrap();
+        let mut mock = seeded_mock();
+        let mut old = [0u8; ROM_LEN];
+        old[0] = 0x11;
+        mock.seed_rom(old);
+        let mut ec = Ec::new(mock);
+
+        let err = execute(Plan::Save, &mut ec, &blocked).expect_err("backup must fail");
+        assert!(!err.to_string().is_empty(), "got {err}");
+        assert_eq!(ec.bus.rom, Some(old), "flash must not be erased");
+        assert!(
+            ec.bus.writes_to(PAGE_FAN_ROM, 0).is_empty(),
+            "no ROM data writes"
+        );
     }
 }

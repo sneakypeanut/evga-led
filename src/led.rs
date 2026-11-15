@@ -37,6 +37,18 @@
 //!   "RGB On" toggle writes data 1; reading it is a SET with subcommand 1 then
 //!   a GET (`Data1Report`: 7-byte command, data byte, 9 reserved, no checksum).
 //!
+//! Other reports used here (same 7-byte command header, Pack=1):
+//! * `StaticOnReport` (report 7, main 3): checksum, zone bitmask, then five
+//!   4-byte ARGB slots (brightness, R, G, B) at [9..29) in zone order; the
+//!   checksum covers bytes 0..6 and 8..28.
+//! * `SpeedRangeReport` (report 7, main 0x20, sub 2 ReadDefault): checksum,
+//!   then seven (min, default, max) u16 LE triples at [8..50) with *no* zone
+//!   byte; the checksum covers bytes 0..6 and 8..49.
+//! * `CommandReport` (report 4, main 0x12 SaveProfile): 7-byte command and 10
+//!   zero bytes, no checksum.
+//! * The MCU firmware version is the USB bcdDevice minus 0xA000, shown as
+//!   three hex digits with a dot after the first (0xA101 -> 1.01).
+//!
 //! Access: `/dev/hidrawN` is root-only. Install
 //! `SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3842", ATTRS{idProduct}=="300e", TAG+="uaccess"`
 //! in /etc/udev/rules.d/ (60-evga-led.rules) so the logged-in user can open it.
@@ -58,6 +70,16 @@ pub const BUFLEN: usize = 226;
 pub const MAIN_LIGHT_EFFECT: u8 = 1;
 pub const SUB_WRITE: u8 = 0;
 pub const SUB_READ: u8 = 1;
+/// `LEDSubCommand.ReadDefault`.
+pub const SUB_READ_DEFAULT: u8 = 2;
+/// `LEDMainCommand.StaticOn`: per-zone brightness and color for mode "on".
+pub const MAIN_STATIC_ON: u8 = 3;
+/// `LEDMainCommand.SpeedRange`.
+pub const MAIN_SPEED_RANGE: u8 = 0x20;
+/// End of the `StaticOnReport` payload: checksum, zone, 5 ARGB slots.
+const STATIC_ON_END: usize = 9 + 4 * 5;
+/// End of the `SpeedRangeReport` payload: checksum, 7 x (min, def, max) u16.
+const SPEED_RANGE_END: usize = 8 + 6 * 7;
 const VENDOR_PRODUCT: &str = "00003842:0000300E";
 /// `85 07` in a HID report descriptor: Report ID 7.
 const REPORT7_TAG: [u8; 2] = [0x85, 0x07];
@@ -66,6 +88,8 @@ pub const GENERAL_REPORT_ID: u8 = 0x04;
 pub const GENERAL_LEN: usize = 17;
 /// `GeneralMainCommand.LEDDarkMode`: data 0 = dark (every zone off), 1 = lit.
 pub const MAIN_LED_DARK_MODE: u8 = 0x50;
+/// `GeneralMainCommand.SaveProfile`: store the current LED settings in the MCU.
+pub const MAIN_SAVE_PROFILE: u8 = 0x12;
 const RESP_SUCCESS: u8 = 0xC0;
 const RESP_IN_PROCESS: u8 = 0xC2;
 /// ELeet X1 waits 5 ms between the SET and the GET of every command.
@@ -125,11 +149,14 @@ pub struct Cli {
     device: Option<PathBuf>,
     #[arg(value_enum, default_value_t = Action::Status)]
     action: Action,
-    /// mode name for 'mode'
+    /// mode name for 'mode', RRGGBB for 'color'
     mode: Option<String>,
     /// all | onboard | argb1..argb4
     #[arg(short, long, default_value = "all")]
     zone: String,
+    /// brightness for 'color' (0-255)
+    #[arg(long, default_value_t = 255)]
+    brightness: u8,
     /// print the frame without touching the device
     #[arg(short = 'n', long)]
     dry_run: bool,
@@ -142,12 +169,16 @@ enum Action {
     Mode,
     Status,
     Detect,
+    Color,
+    Save,
+    Speeds,
+    Version,
 }
 
 /// Run the parsed `led` command.
 pub fn run(cli: Cli) -> Result<()> {
     if let Some(mode) = &cli.mode {
-        if cli.action != Action::Mode {
+        if !matches!(cli.action, Action::Mode | Action::Color) {
             let action = cli.action.to_possible_value().expect("no skipped variants");
             return Err(
                 format!("'{}' takes no mode name (got '{mode}')", action.get_name()).into(),
@@ -161,6 +192,36 @@ fn execute(cli: &Cli) -> Result<()> {
     match cli.action {
         Action::Detect => do_detect(&find_device(cli.device.as_deref())?),
         Action::Status => do_status(&find_device(cli.device.as_deref())?),
+        Action::Speeds => do_speeds(&find_device(cli.device.as_deref())?),
+        Action::Version => {
+            println!(
+                "mcu version: {}",
+                mcu_version(&find_device(cli.device.as_deref())?)?
+            );
+            Ok(())
+        }
+        Action::Save => {
+            let path = if cli.dry_run {
+                None
+            } else {
+                Some(find_device(cli.device.as_deref())?)
+            };
+            do_save(path.as_deref())
+        }
+        Action::Color => {
+            let zone = parse_zone(&cli.zone)?;
+            let rgb = parse_color(
+                cli.mode
+                    .as_deref()
+                    .ok_or("'color' needs a color (RRGGBB)")?,
+            )?;
+            let path = if cli.dry_run {
+                None
+            } else {
+                Some(find_device(cli.device.as_deref())?)
+            };
+            do_color(path.as_deref(), zone, cli.brightness, rgb)
+        }
         Action::Off | Action::On | Action::Mode => {
             let zone = parse_zone(&cli.zone)?;
             let mode = match cli.action {
@@ -198,6 +259,16 @@ fn parse_zone(name: &str) -> Result<u8> {
 fn parse_mode(name: &str) -> Result<u8> {
     lookup(&MODES, &name.to_lowercase())
         .ok_or_else(|| format!("unknown mode '{name}': {}", sorted_names(&MODES)).into())
+}
+
+/// `RRGGBB` or `#RRGGBB`, exactly six hex digits in either case.
+fn parse_color(text: &str) -> Result<[u8; 3]> {
+    let hex = text.strip_prefix('#').unwrap_or(text);
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid color '{text}': expected RRGGBB or #RRGGBB").into());
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).expect("checked hex digits");
+    Ok([channel(0), channel(2), channel(4)])
 }
 
 fn mode_name(mode: u8) -> String {
@@ -241,11 +312,47 @@ pub fn build_frame(zone: u8, mode: u8, sub: u8) -> [u8; BUFLEN] {
             }
         }
     }
+    set_checksum(&mut buf, 14);
+    buf
+}
+
+/// Store at [7] the two's complement of the sum of bytes 0..7 and 8..`end`.
+fn set_checksum(buf: &mut [u8; BUFLEN], end: usize) {
     let sum = buf[0..7]
         .iter()
-        .chain(&buf[8..14])
+        .chain(&buf[8..end])
         .fold(0u8, |acc, &b| acc.wrapping_add(b));
     buf[7] = sum.wrapping_neg();
+}
+
+/// Build a report-7 `StaticOnReport` write: `brightness` and `rgb` go into the
+/// ARGB slot of every zone in `zone`; the other slots stay zero.
+pub fn build_static_frame(zone: u8, brightness: u8, rgb: [u8; 3]) -> [u8; BUFLEN] {
+    let mut buf = [0u8; BUFLEN];
+    buf[..5].copy_from_slice(&[REPORT_ID, HEADER1, HEADER2, MAIN_STATIC_ON, SUB_WRITE]);
+    buf[8] = zone;
+    for (idx, &(_, bit)) in ZONE_ORDER.iter().enumerate() {
+        if zone & bit != 0 {
+            let slot = 9 + 4 * idx;
+            buf[slot] = brightness;
+            buf[slot + 1..slot + 4].copy_from_slice(&rgb);
+        }
+    }
+    set_checksum(&mut buf, STATIC_ON_END);
+    buf
+}
+
+/// Build the report-7 `SpeedRangeReport` ReadDefault query (no zone byte).
+pub fn build_speed_query() -> [u8; BUFLEN] {
+    let mut buf = [0u8; BUFLEN];
+    buf[..5].copy_from_slice(&[
+        REPORT_ID,
+        HEADER1,
+        HEADER2,
+        MAIN_SPEED_RANGE,
+        SUB_READ_DEFAULT,
+    ]);
+    set_checksum(&mut buf, SPEED_RANGE_END);
     buf
 }
 
@@ -285,6 +392,38 @@ fn find_device_in(dev: &Path, sys_hidraw: &Path) -> Result<PathBuf> {
 
 fn has_report7(desc: &[u8]) -> bool {
     desc.windows(2).any(|w| w == REPORT7_TAG)
+}
+
+/// MCU firmware version from the USB bcdDevice of the hidraw node's device.
+fn mcu_version(node: &Path) -> Result<String> {
+    mcu_version_in(Path::new("/sys/class/hidraw"), node)
+}
+
+/// The hidraw `device` link names the HID device; the USB device that owns
+/// bcdDevice sits above it (two levels up on this board, past the interface).
+fn mcu_version_in(sys_hidraw: &Path, node: &Path) -> Result<String> {
+    let name = node.file_name().unwrap_or(node.as_os_str());
+    let device = sys_hidraw.join(name).join("device");
+    let real = fs::canonicalize(&device).map_err(|e| format!("{}: {e}", device.display()))?;
+    let bcd_path = real
+        .ancestors()
+        .map(|dir| dir.join("bcdDevice"))
+        .find(|p| p.is_file())
+        .ok_or_else(|| format!("no USB bcdDevice above {}", real.display()))?;
+    let text = fs::read_to_string(&bcd_path)?;
+    let bcd = u16::from_str_radix(text.trim(), 16)
+        .map_err(|_| format!("{}: not hex: '{}'", bcd_path.display(), text.trim()))?;
+    format_mcu_version(bcd)
+}
+
+/// The vendor's `(VersionNumber - 0xA000).ToString("X3").Insert(1, ".")`.
+fn format_mcu_version(bcd: u16) -> Result<String> {
+    let mcu = bcd
+        .checked_sub(0xA000)
+        .ok_or_else(|| format!("bcdDevice 0x{bcd:04X} is below 0xA000"))?;
+    let mut text = format!("{mcu:03X}");
+    text.insert(1, '.');
+    Ok(text)
 }
 
 fn descriptor_path(node: &Path) -> PathBuf {
@@ -451,6 +590,20 @@ fn read_zone_modes<D: Feature>(dev: &mut D) -> Result<[u8; 5]> {
     Ok(modes)
 }
 
+/// Read the (min, default, max) speed of each effect family, in vendor order.
+fn read_speed_ranges<D: Feature>(dev: &mut D) -> Result<[[u16; 3]; 7]> {
+    let mut frame = build_speed_query();
+    transact(dev, &mut frame)?;
+    let mut ranges = [[0u16; 3]; 7];
+    for (i, range) in ranges.iter_mut().enumerate() {
+        for (j, value) in range.iter_mut().enumerate() {
+            let at = 8 + 6 * i + 2 * j;
+            *value = u16::from_le_bytes([frame[at], frame[at + 1]]);
+        }
+    }
+    Ok(ranges)
+}
+
 /// Symbolic errno name like Python's `errno.errorcode`, else the number.
 fn errno_name(err: &io::Error) -> String {
     let Some(code) = err.raw_os_error() else {
@@ -551,6 +704,93 @@ fn set_zones<D: Feature>(dev: &mut D, zone: u8, mode: u8) -> Result<()> {
     Ok(())
 }
 
+fn color_dry_run_lines(
+    zone: u8,
+    brightness: u8,
+    rgb: [u8; 3],
+    frame: &[u8; BUFLEN],
+) -> [String; 2] {
+    [
+        format!(
+            "zone=0x{zone:02X} color={} brightness={brightness} checksum=0x{:02X}",
+            color_hex(rgb),
+            frame[7]
+        ),
+        format!(
+            "{} + {} reserved bytes",
+            hex_bytes(&frame[..STATIC_ON_END]),
+            BUFLEN - STATIC_ON_END
+        ),
+    ]
+}
+
+fn color_hex(rgb: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+}
+
+fn do_color(path: Option<&Path>, zone: u8, brightness: u8, rgb: [u8; 3]) -> Result<()> {
+    let Some(path) = path else {
+        for line in dry_run_lines(zone, 1, &build_frame(zone, 1, SUB_WRITE)) {
+            println!("{line}");
+        }
+        let frame = build_static_frame(zone, brightness, rgb);
+        for line in color_dry_run_lines(zone, brightness, rgb, &frame) {
+            println!("{line}");
+        }
+        return Ok(());
+    };
+    set_color(&mut Hidraw(open_node(path)?), zone, brightness, rgb)
+}
+
+/// Switch the zones to StaticOn (lighting a dark global switch, as `on`
+/// does), then write their brightness and color.
+fn set_color<D: Feature>(dev: &mut D, zone: u8, brightness: u8, rgb: [u8; 3]) -> Result<()> {
+    set_zones(dev, zone, 1)?;
+    let mut frame = build_static_frame(zone, brightness, rgb);
+    let checksum = frame[7];
+    transact(dev, &mut frame)?;
+    println!(
+        "sent: zone 0x{zone:02X} -> color {} brightness {brightness} (checksum 0x{checksum:02X})",
+        color_hex(rgb)
+    );
+    Ok(())
+}
+
+fn do_save(path: Option<&Path>) -> Result<()> {
+    let Some(path) = path else {
+        println!("{}", hex_bytes(&save_frame()));
+        return Ok(());
+    };
+    save_profile(&mut Hidraw(open_node(path)?))
+}
+
+/// `CommandReport(SaveProfile)`: the 7-byte command and 10 zero bytes.
+fn save_frame() -> [u8; GENERAL_LEN] {
+    build_general_frame(MAIN_SAVE_PROFILE, SUB_WRITE, 0)
+}
+
+fn save_profile<D: Feature>(dev: &mut D) -> Result<()> {
+    transact(dev, &mut save_frame())?;
+    println!("saved: current LED settings stored in the MCU profile");
+    Ok(())
+}
+
+fn speed_lines(ranges: &[[u16; 3]; 7]) -> Vec<String> {
+    let mut lines = vec!["speed ranges (min/default/max, read from the MCU):".to_string()];
+    for (name, [min, def, max]) in MODE_NAMES[2..].iter().zip(ranges) {
+        lines.push(format!("  {name:11} {min}/{def}/{max}"));
+    }
+    lines
+}
+
+fn do_speeds(path: &Path) -> Result<()> {
+    let ranges = read_speed_ranges(&mut Hidraw(open_node(path)?))?;
+    for line in speed_lines(&ranges) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn do_status(path: &Path) -> Result<()> {
     for line in status_report(&mut Hidraw(open_node(path)?))? {
         println!("{line}");
@@ -572,6 +812,10 @@ fn do_detect(path: &Path) -> Result<()> {
             if has_report7(&desc) { "True" } else { "False" }
         ),
         Err(e) => println!("descriptor unreadable here: {e}"),
+    }
+    match mcu_version(path) {
+        Ok(version) => println!("mcu version: {version}"),
+        Err(e) => println!("mcu version unreadable here: {e}"),
     }
     Ok(())
 }
@@ -820,6 +1064,11 @@ mod tests {
         dark_data: Option<u8>,
         /// Echo a nonzero subcommand 2 on every reply.
         garble_sub2: bool,
+        /// StaticOn ARGB slot per zone.
+        colors: [[u8; 4]; 5],
+        /// SpeedRange (min, default, max) per effect family.
+        speeds: [[u16; 3]; 7],
+        saved: bool,
     }
 
     impl Mcu {
@@ -865,6 +1114,21 @@ mod tests {
                 (GENERAL_REPORT_ID, MAIN_LED_DARK_MODE, SUB_READ) => {
                     reply[7] = self.dark_data.unwrap_or(u8::from(!self.dark));
                 }
+                (REPORT_ID, MAIN_STATIC_ON, SUB_WRITE) => {
+                    for (idx, &(_, bit)) in ZONE_ORDER.iter().enumerate() {
+                        if buf[8] & bit != 0 {
+                            self.colors[idx].copy_from_slice(&buf[9 + 4 * idx..13 + 4 * idx]);
+                        }
+                    }
+                }
+                (REPORT_ID, MAIN_SPEED_RANGE, SUB_READ_DEFAULT) => {
+                    let bytes = self.speeds.iter().flatten().flat_map(|v| v.to_le_bytes());
+                    for (dst, b) in reply[8..].iter_mut().zip(bytes) {
+                        *dst = b;
+                    }
+                    reply[7] = 0x5A; // the device fills its own checksum
+                }
+                (GENERAL_REPORT_ID, MAIN_SAVE_PROFILE, SUB_WRITE) => self.saved = true,
                 _ => reply[6] = 0xC1,
             }
             if self.garble_sub2 {
@@ -1004,6 +1268,197 @@ mod tests {
     }
 
     #[test]
+    fn static_on_frame_fills_only_selected_argb_slots() {
+        // argb2|cover, brightness 0x80, #123456; checksum computed in Python
+        // over bytes 0..6 and 8..28: 0xC0.
+        let f = build_static_frame(0x12, 0x80, [0x12, 0x34, 0x56]);
+        assert_eq!(
+            hex_bytes(&f[..29]),
+            "07 ea 02 03 00 00 00 c0 12 00 00 00 00 80 12 34 56 00 00 00 00 00 00 00 00 80 12 34 56"
+        );
+        assert!(f[29..].iter().all(|&b| b == 0));
+        let sum: u32 = f[..29].iter().map(|&b| u32::from(b)).sum();
+        assert_eq!(sum % 256, 0, "checksum covers every ARGB slot");
+    }
+
+    #[test]
+    fn speed_query_has_no_zone_byte_and_replies_parse_as_le_triples() {
+        // -(7 + 0xEA + 2 + 0x20 + 2) mod 256 = 0xEB; [8] is the first range, not a zone.
+        let q = build_speed_query();
+        assert_eq!(&q[..9], &[7, 0xEA, 2, 0x20, 2, 0, 0, 0xEB, 0]);
+        assert!(q[8..].iter().all(|&b| b == 0));
+
+        let speeds = [
+            [1000, 5000, 20000],
+            [258, 772, 1286],
+            [1, 2, 3],
+            [300, 301, 302],
+            [10, 20, 30],
+            [65535, 256, 0],
+            [7, 8, 9],
+        ];
+        let mut mcu = Mcu {
+            speeds,
+            ..Mcu::default()
+        };
+        assert_eq!(read_speed_ranges(&mut mcu).unwrap(), speeds);
+        assert_eq!(mcu.sets.len(), 1, "one query, nothing written");
+        assert_eq!(
+            speed_lines(&speeds),
+            [
+                "speed ranges (min/default/max, read from the MCU):",
+                "  breathing   1000/5000/20000",
+                "  rainbow     258/772/1286",
+                "  pulse       1/2/3",
+                "  rainbowwave 300/301/302",
+                "  wave        10/20/30",
+                "  star        65535/256/0",
+                "  colorstack  7/8/9",
+            ]
+        );
+    }
+
+    #[test]
+    fn colors_need_exactly_six_hex_digits() {
+        assert_eq!(parse_color("#FF8000").unwrap(), [0xFF, 0x80, 0x00]);
+        assert_eq!(parse_color("ff8000").unwrap(), [0xFF, 0x80, 0x00]);
+        assert_eq!(parse_color("aB12Cd").unwrap(), [0xAB, 0x12, 0xCD]);
+        for bad in [
+            "", "#", "fff", "#ff80001", "gg0000", "+f8000", "##ff800", "ff 800", "ff8０0",
+        ] {
+            assert_eq!(
+                parse_color(bad).unwrap_err().to_string(),
+                format!("invalid color '{bad}': expected RRGGBB or #RRGGBB")
+            );
+        }
+    }
+
+    #[test]
+    fn color_switches_zones_on_lights_the_switch_and_writes_argb() {
+        let mut mcu = Mcu {
+            dark: true,
+            colors: [[9; 4]; 5],
+            ..Mcu::default()
+        };
+        set_color(&mut mcu, 0x12, 0x40, [0xFF, 0x80, 0x00]).unwrap();
+        assert_eq!(mcu.modes, [0, 1, 0, 0, 1]);
+        assert!(!mcu.dark);
+        assert_eq!(
+            mcu.colors,
+            [
+                [9; 4],
+                [0x40, 0xFF, 0x80, 0],
+                [9; 4],
+                [9; 4],
+                [0x40, 0xFF, 0x80, 0]
+            ]
+        );
+        // Mode SET first, then the dark gate, then the StaticOn write last.
+        assert_eq!(mcu.sets[0][3], MAIN_LIGHT_EFFECT);
+        assert_eq!(mcu.dark_writes(), [1]);
+        let last = mcu.sets.last().unwrap();
+        assert_eq!(
+            *last,
+            build_static_frame(0x12, 0x40, [0xFF, 0x80, 0]).to_vec()
+        );
+
+        let mut mcu = Mcu {
+            report7_response: Some(0xC1),
+            ..Mcu::default()
+        };
+        assert!(set_color(&mut mcu, 31, 255, [1, 2, 3]).is_err());
+        assert!(
+            mcu.sets.iter().all(|f| f[3] != MAIN_STATIC_ON),
+            "no color write after a failed mode write"
+        );
+    }
+
+    #[test]
+    fn color_dry_run_prints_mode_and_static_frames() {
+        let f = build_static_frame(31, 64, [0xFF, 0x80, 0]);
+        assert_eq!(
+            color_dry_run_lines(31, 64, [0xFF, 0x80, 0], &f),
+            [
+                "zone=0x1F color=#FF8000 brightness=64 checksum=0x30".to_string(),
+                "07 ea 02 03 00 00 00 30 1f 40 ff 80 00 40 ff 80 00 40 ff 80 00 40 ff 80 00 \
+                 40 ff 80 00 + 197 reserved bytes"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            dry_run_lines(31, 1, &build_frame(31, 1, SUB_WRITE))[0],
+            "zone=0x1F mode=1 checksum=0xE8"
+        );
+    }
+
+    #[test]
+    fn save_sends_the_commandreport_and_needs_success() {
+        assert_eq!(
+            hex_bytes(&save_frame()),
+            "04 ea 02 12 00 00 00 00 00 00 00 00 00 00 00 00 00"
+        );
+        let mut mcu = Mcu::default();
+        save_profile(&mut mcu).unwrap();
+        assert!(mcu.saved);
+        assert_eq!(mcu.sets, [save_frame().to_vec()]);
+
+        let mut mcu = Mcu {
+            garble_sub2: true,
+            ..Mcu::default()
+        };
+        assert!(save_profile(&mut mcu).is_err());
+    }
+
+    #[test]
+    fn mcu_version_matches_vendor_format() {
+        assert_eq!(format_mcu_version(0xA101).unwrap(), "1.01");
+        assert_eq!(format_mcu_version(0xA123).unwrap(), "1.23");
+        assert_eq!(format_mcu_version(0xA0AB).unwrap(), "0.AB");
+        assert_eq!(format_mcu_version(0xA000).unwrap(), "0.00");
+        assert_eq!(
+            format_mcu_version(0x0101).unwrap_err().to_string(),
+            "bcdDevice 0x0101 is below 0xA000"
+        );
+    }
+
+    #[test]
+    fn new_actions_parse_and_validate_arguments() {
+        let cli = parse(&["color", "#00ff00"]).unwrap();
+        assert_eq!(cli.action, Action::Color);
+        assert_eq!(cli.brightness, 255);
+        assert_eq!(
+            parse(&["color", "00ff00", "--brightness", "0"])
+                .unwrap()
+                .brightness,
+            0
+        );
+        assert!(parse(&["color", "00ff00", "--brightness", "256"]).is_err());
+        assert!(parse(&["color", "00ff00", "--brightness", "-1"]).is_err());
+
+        let run_args = |args: &[&str]| run(parse(args).unwrap()).map_err(|e| e.to_string());
+        let missing = "/nonexistent/hidraw0";
+        assert!(run_args(&["--device", missing, "-n", "-z", "argb3", "color", "#AbCdEf"]).is_ok());
+        assert!(run_args(&["--device", missing, "-n", "save"]).is_ok());
+        assert_eq!(
+            run_args(&["-n", "color"]).unwrap_err(),
+            "'color' needs a color (RRGGBB)"
+        );
+        assert_eq!(
+            run_args(&["-n", "color", "red"]).unwrap_err(),
+            "invalid color 'red': expected RRGGBB or #RRGGBB"
+        );
+        assert!(run_args(&["-n", "-z", "bogus", "color", "ffffff"])
+            .unwrap_err()
+            .starts_with("unknown zone 'bogus'"));
+        for action in ["save", "speeds", "version"] {
+            assert_eq!(
+                run_args(&[action, "x"]).unwrap_err(),
+                format!("'{action}' takes no mode name (got 'x')")
+            );
+        }
+    }
+
+    #[test]
     fn errno_names() {
         assert_eq!(
             errno_name(&io::Error::from_raw_os_error(libc::EPIPE)),
@@ -1070,6 +1525,31 @@ mod tests {
         t.node("hidraw2", Some(EVGA), &[0x85, 0x03]);
         t.node("hidraw10", Some(EVGA), &[0x85, 0x04]);
         assert_eq!(t.find().unwrap(), t.0.join("dev/hidraw10"));
+    }
+
+    #[test]
+    fn mcu_version_reads_bcd_device_of_the_owning_usb_device() {
+        // Same shape as this board: hidraw6/device -> .../1-12/1-12:1.1/0003:3842:300E.0007,
+        // with bcdDevice on the USB device 1-12, two levels above the HID device.
+        let t = TempTree::new();
+        let usb = t.0.join("devices/usb1/1-12");
+        let hid = usb.join("1-12:1.1/0003:3842:300E.0007");
+        fs::create_dir_all(&hid).unwrap();
+        fs::write(usb.join("bcdDevice"), "a101\n").unwrap();
+        fs::create_dir_all(t.0.join("sys/hidraw6")).unwrap();
+        std::os::unix::fs::symlink(&hid, t.0.join("sys/hidraw6/device")).unwrap();
+        let sys = t.0.join("sys");
+        assert_eq!(
+            mcu_version_in(&sys, Path::new("/dev/hidraw6")).unwrap(),
+            "1.01"
+        );
+
+        fs::write(usb.join("bcdDevice"), "zz\n").unwrap();
+        let err = mcu_version_in(&sys, Path::new("/dev/hidraw6"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.ends_with("bcdDevice: not hex: 'zz'"), "{err}");
+        assert!(mcu_version_in(&sys, Path::new("/dev/hidraw9")).is_err());
     }
 
     #[test]
